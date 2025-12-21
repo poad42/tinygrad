@@ -246,6 +246,13 @@ class Scheduler:
           if not (axis < len(axis_choices)): continue
           axes = list(axis_choices[axis])
 
+          # cost-model prefilter: on AMD gfx12, avoid TC/WMMA for skinny shapes
+          if getenv("TC_PREFILTER", 0) and self.ren.device == "AMD" and str(self.ren.suffix).startswith("gfx12"):
+            n_sz, m_sz = axes[0].vmax+1, axes[1].vmax+1
+            min_n, min_m = getenv("TC_MIN_N", tc.dims[0]), getenv("TC_MIN_M", tc.dims[1])
+            if isinstance(n_sz, int) and isinstance(m_sz, int) and (n_sz < min_n or m_sz < min_m):
+              continue
+
           # tag the reduceop
           self.ast = self.ast.substitute({reduceop: reduceop.replace(tag="TC")})
 
