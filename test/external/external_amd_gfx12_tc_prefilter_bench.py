@@ -29,15 +29,25 @@ def main():
   print("TC_PREFILTER", os.getenv("TC_PREFILTER"))
   print("TC_MIN_M", os.getenv("TC_MIN_M"), "TC_MIN_N", os.getenv("TC_MIN_N"))
 
-  # skinny shapes first, then more square-ish
+  # skinny shapes first, then larger M, then more square-ish
   shapes = [
     (1, 4096, 4096),
     (4, 4096, 4096),
     (8, 4096, 4096),
     (16, 4096, 4096),
     (32, 4096, 4096),
+
+    (64, 4096, 4096),
+    (128, 4096, 4096),
+    (256, 4096, 4096),
+    (512, 4096, 4096),
+    (1024, 4096, 4096),
+
     (128, 128, 128),
     (256, 256, 256),
+    (512, 512, 512),
+    (1024, 1024, 1024),
+    (2048, 2048, 2048),
   ]
 
   for m,n,k in shapes:
