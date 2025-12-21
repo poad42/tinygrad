@@ -10,8 +10,8 @@ from tinygrad import Tensor, Device
 
 
 def run_matmul(m:int, n:int, k:int, iters:int=10) -> float:
-  a = Tensor.rand(m, k, dtype=Tensor.default_dtype).realize()
-  b = Tensor.rand(k, n, dtype=Tensor.default_dtype).realize()
+  a = Tensor.rand(m, k).realize()
+  b = Tensor.rand(k, n).realize()
   # warmup
   (a @ b).realize()
   Device[Device.DEFAULT].synchronize()
