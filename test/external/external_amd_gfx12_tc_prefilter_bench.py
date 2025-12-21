@@ -7,7 +7,7 @@ from tinygrad.dtype import dtypes
 #   DEVICE=AMD TC_PREFILTER=0 python test/external/external_amd_gfx12_tc_prefilter_bench.py
 #   DEVICE=AMD TC_PREFILTER=1 python test/external/external_amd_gfx12_tc_prefilter_bench.py
 # Optionally override thresholds:
-#   TC_MIN_M=16 TC_MIN_N=16
+#   TC_MIN_M=16 TC_MIN_N=16 TC_MIN_K=16
 
 
 def _pick_dtype() -> dtypes:
@@ -48,7 +48,7 @@ def run_matmul(m:int, n:int, k:int) -> tuple[bool, float]:
 def main():
   print("DEVICE", Device.DEFAULT)
   print("TC_PREFILTER", os.getenv("TC_PREFILTER"))
-  print("TC_MIN_M", os.getenv("TC_MIN_M"), "TC_MIN_N", os.getenv("TC_MIN_N"))
+  print("TC_MIN_M", os.getenv("TC_MIN_M"), "TC_MIN_N", os.getenv("TC_MIN_N"), "TC_MIN_K", os.getenv("TC_MIN_K"))
   print("MATMUL_DTYPE", os.getenv("MATMUL_DTYPE") or "half")
 
   # WMMA-friendly shapes (multiples of 16)
