@@ -2374,6 +2374,11 @@ class Tensor(OpMixin):
     """
     if IMAGE: return self.image_dot(w, dtype)
     x, dx, dw = self, self.ndim, w.ndim
+
+    # fp8 dot kernels expect fp8 buffers. If the fp8 cast is fused (ex: x.div(scale).cast(fp8)), some backends can mis-handle the fp8 data path.
+    # Realizing here preserves correctness and matches the explicit-quantize behavior.
+    if x.dtype in dtypes.fp8s and x.uop.op is not Ops.BUFFER: x = x.realize()
+    if w.dtype in dtypes.fp8s and w.uop.op is not Ops.BUFFER: w = w.realize()
     if not (dx > 0 and dw > 0): raise RuntimeError(f"both tensors need to be at least 1D, got {dx}D and {dw}D")
     if x.shape[-1] != w.shape[axis_w:=-min(w.ndim,2)]: raise RuntimeError(f"cannot dot {x.shape} and {w.shape}")
     x = x.reshape(*x.shape[0:-1], *[1]*min(dx-1, dw-1, 1), x.shape[-1])
