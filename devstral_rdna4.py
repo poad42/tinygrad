@@ -21,6 +21,7 @@ import datetime
 from typing import Optional, List, Dict, Tuple, Union
 
 from tinygrad import Tensor, Device, dtypes, TinyJit, Variable
+from tinygrad.device import CompileError
 from tinygrad.nn.state import safe_load
 try:
     from tqdm import tqdm  # type: ignore
@@ -691,14 +692,7 @@ def main():
         os.environ["FP8_DISABLE"] = "1"
 
     if args.flash_attn:
-        try:
-            arch = str(getattr(getattr(Device[Device.DEFAULT], "compiler", None), "arch", ""))
-        except Exception:
-            arch = ""
-        if arch.split(":")[0] in ("gfx1200", "gfx1201"):
-            print(f"[WARN] --flash-attn is currently unsupported on {arch} (thunder WMMA ABI mismatch). Ignoring.")
-        else:
-            os.environ["FLASH_ATTENTION"] = "1"
+        os.environ["FLASH_ATTENTION"] = "1"
 
     if args.oracle is not None:
         try:
@@ -812,6 +806,22 @@ def main():
         except Exception:
             pass
 
+    flash_fell_back = False
+    def _maybe_fallback_flash(e: Exception) -> bool:
+        nonlocal flash_fell_back
+        if flash_fell_back:
+            return False
+        if os.environ.get("FLASH_ATTENTION", "0") in ("", "0"):
+            return False
+        if os.environ.get("FLASH_ATTENTION_FALLBACK", "1") in ("", "0"):
+            return False
+        if not isinstance(e, CompileError):
+            return False
+        flash_fell_back = True
+        os.environ["FLASH_ATTENTION"] = "0"
+        print(f"[WARN] FLASH_ATTENTION compile failed; falling back to naive SDPA ({e})")
+        return True
+
     print("\n[Prefill Stage]")
     x = Tensor([tokens], device=model.device)
     t_prefill_st = time.perf_counter()
@@ -820,6 +830,11 @@ def main():
     except TimeoutError as e:
         print(f"\n\n⏱️  Prefill timed out: {e}")
         return
+    except Exception as e:
+        if _maybe_fallback_flash(e):
+            logits = _with_timeout(lambda: model(x, start_pos=0).realize())
+        else:
+            raise
     _sync()
     t_prefill = time.perf_counter() - t_prefill_st
     
@@ -875,6 +890,12 @@ def main():
         except TimeoutError as e:
             print(f"\n\n⏱️  Decode timed out at step {i}: {e}")
             break
+        except Exception as e:
+            if _maybe_fallback_flash(e):
+                decode_step = None
+                logits = _with_timeout(lambda: model(x_dec, start_pos=start_pos).realize())
+            else:
+                raise
         _sync()
         
         next_logits = logits[0, -1]
