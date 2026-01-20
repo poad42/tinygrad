@@ -1,6 +1,7 @@
 import math
 
 from tinygrad import Tensor, dtypes
+from tinygrad.helpers import getenv
 from tinygrad.uop.ops import UOp
 
 from extra.thunder.tiny.tk import WARP_THREADS
@@ -29,7 +30,8 @@ def flash_attention(xq, xk, xv, attn_mask:Tensor|None=None, is_causal:bool=False
   B, N, H, D = xq.shape
   H_KV = xk.shape[2]
   GROUP_SIZE = H // H_KV
-  print(f"Flash Attention {B=} {N=} {H=} {D=} {H_KV=} {GROUP_SIZE=}")
+  if getenv("FA_DEBUG"):
+    print(f"Flash Attention {B=} {N=} {H=} {D=} {H_KV=} {GROUP_SIZE=}")
 
   def custom_forward(ou:UOp, l_vecu:UOp, qu:UOp, ku:UOp, vu:UOp, masku:UOp) -> UOp:
     with Kernel("fa_custom_forward", (H, N // (Q_BLOCK_SIZE*NUM_WORKERS), B), NUM_WORKERS * WARP_THREADS) as ker:
@@ -340,7 +342,8 @@ def flash_attention(xq, xk, xv, attn_mask:Tensor|None=None, is_causal:bool=False
     mask = Tensor(kernel.src[5])
 
     delta_vec = (grad * attn).sum(-1).transpose(1, 2).unsqueeze(-2).detach()
-    print(l_vec.shape, delta_vec.shape, grad.shape, attn.shape, grad_q.shape, grad_k.shape, grad_v.shape)
+    if getenv("FA_DEBUG"):
+      print(l_vec.shape, delta_vec.shape, grad.shape, attn.shape, grad_q.shape, grad_k.shape, grad_v.shape)
 
     grad_q = Tensor.custom_kernel(grad_q, grad, q, k, v, mask, l_vec, delta_vec, fxn=custom_backward_q)[0]
     grad_k, grad_v = Tensor.custom_kernel(grad_k, grad_v, grad, q, k, v, mask, l_vec, delta_vec, fxn=custom_backward_kv)[:2]
