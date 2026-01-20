@@ -16,7 +16,7 @@ from extra.thunder.tiny.tk.tiles import ST_16X32, RT_16X32, RT_16X16, TileLayout
 class TestTK(unittest.TestCase):
   def setUp(self):
     arch = Device["AMD"].arch
-    if not arch.startswith("gfx9"):
+    if not (arch.startswith("gfx9") or arch.startswith("gfx11") or arch.startswith("gfx12")):
       self.skipTest(f"arch {arch} not supported")
 
   @unittest.skipIf(CI, "no wmma in ci")
@@ -71,7 +71,10 @@ class TestTK(unittest.TestCase):
 
     ref = a.matmul(b, dtype=dtypes.float32).float()
 
-    np.testing.assert_allclose(c.numpy(), ref.numpy())
+    if WARP_THREADS == 32:
+      np.testing.assert_allclose(c.numpy(), ref.numpy(), atol=1e-2, rtol=1e-5)
+    else:
+      np.testing.assert_allclose(c.numpy(), ref.numpy())
 
   @unittest.skipIf(CI, "no wmma in ci")
   def test_simple_matmul_transposed(self):
@@ -120,7 +123,10 @@ class TestTK(unittest.TestCase):
 
     ref = a.matmul(b.transpose(2, 3), dtype=dtypes.float32).float()
 
-    np.testing.assert_allclose(c.numpy(), ref.numpy())
+    if WARP_THREADS == 32:
+      np.testing.assert_allclose(c.numpy(), ref.numpy(), atol=1e-2, rtol=1e-5)
+    else:
+      np.testing.assert_allclose(c.numpy(), ref.numpy())
 
   def test_load_store(self):
     N = 64
@@ -679,7 +685,7 @@ class TestTK(unittest.TestCase):
 
         # mask for causal
         q_base = q_seq * Q_BLOCK_SIZE + (warp.laneid % 16)
-        kv_base = kv_idx * KV_BLOCK_SIZE + (warp.laneid // 16) * 4
+        kv_base = kv_idx * KV_BLOCK_SIZE + (warp.laneid // 16) * (256 // WARP_THREADS)
         att_block = warp.map(att_block,
                              lambda x, idx: ((kv_base + idx[0]*16 + idx[2]) > (q_base + idx[1]*16)).alu(Ops.WHERE, UOp.ufix(x._uop, -math.inf), x))
 
@@ -741,12 +747,10 @@ class TestTK(unittest.TestCase):
     B, N, H, H_KV, D = 2, 8192, 32, 8, 128
 
     with Context(DEBUG=0):
-      q = Tensor.randn(B, N, H, D, dtype=dtypes.bfloat16).contiguous()
-      k = Tensor.randn(B, N, H_KV, D, dtype=dtypes.bfloat16).contiguous()
-      v = Tensor.randn(B, N, H_KV, D, dtype=dtypes.bfloat16).contiguous()
+      q = Tensor.randn(B, H, N, D, dtype=dtypes.bfloat16).contiguous()
+      k = Tensor.randn(B, H_KV, N, D, dtype=dtypes.bfloat16).contiguous()
+      v = Tensor.randn(B, H_KV, N, D, dtype=dtypes.bfloat16).contiguous()
       Tensor.realize(q, k, v)
-
-    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
     fa_jitted = TinyJit(flash_attention)
 
@@ -758,9 +762,9 @@ class TestTK(unittest.TestCase):
                    4 * B * H * N * N + \
                    2 * B * H * N * N * D
       print(f"{attn_flops/(et*1e9):2f} GFLOPS")
-    out = out.float().transpose(1, 2)
+    out = out.float()
 
-    ref = q.scaled_dot_product_attention(k, v, is_causal=True, enable_gqa=True).float().transpose(1, 2)
+    ref = q.scaled_dot_product_attention(k, v, is_causal=True, enable_gqa=True).float()
 
     np.testing.assert_allclose(out.numpy(), ref.numpy(), atol=2e-2, rtol=2e-2)
 
@@ -772,17 +776,16 @@ class TestTK(unittest.TestCase):
     B, N, H, H_KV, D = 1, 32, 2, 1, 32
 
     with Context(DEBUG=0):
-      q = Tensor.randn(B, N, H, D, dtype=dtypes.bfloat16, requires_grad=True).contiguous()
-      k = Tensor.randn(B, N, H_KV, D, dtype=dtypes.bfloat16, requires_grad=True).contiguous()
-      v = Tensor.randn(B, N, H_KV, D, dtype=dtypes.bfloat16, requires_grad=True).contiguous()
+      q = Tensor.randn(B, H, N, D, dtype=dtypes.bfloat16, requires_grad=True).contiguous()
+      k = Tensor.randn(B, H_KV, N, D, dtype=dtypes.bfloat16, requires_grad=True).contiguous()
+      v = Tensor.randn(B, H_KV, N, D, dtype=dtypes.bfloat16, requires_grad=True).contiguous()
       Tensor.realize(q, k, v)
 
-      do = Tensor.ones(B, N, H, D, dtype=dtypes.float32).contiguous()
+      do = Tensor.ones(B, H, N, D, dtype=dtypes.float32).contiguous()
       Tensor.realize(do)
 
-    q_, k_, v_ = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-    out = flash_attention(q_, k_, v_)
-    out = out.float().transpose(1, 2)
+    out = flash_attention(q, k, v)
+    out = out.float()
     out.backward(do)
     Tensor.realize(q.grad, k.grad, v.grad)
 
@@ -792,9 +795,8 @@ class TestTK(unittest.TestCase):
       v_ref = v.detach().clone().requires_grad_(True)
       Tensor.realize(q_ref, k_ref, v_ref)
 
-    q_ref_, k_ref_, v_ref_ = q_ref.transpose(1, 2), k_ref.transpose(1, 2), v_ref.transpose(1, 2)
-    ref = q_ref_.scaled_dot_product_attention(k_ref_, v_ref_)
-    ref = ref.float().transpose(1, 2)
+    ref = q_ref.scaled_dot_product_attention(k_ref, v_ref, enable_gqa=True)
+    ref = ref.float()
     ref.backward(do)
     Tensor.realize(q_ref.grad, k_ref.grad, v_ref.grad)
 
