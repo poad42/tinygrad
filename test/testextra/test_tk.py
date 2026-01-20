@@ -5,7 +5,7 @@ from tinygrad.uop.ops import UOp, Ops
 from tinygrad.engine.realize import get_runner
 from tinygrad.engine.schedule import ExecItem
 from tinygrad.engine.jit import TinyJit
-from tinygrad.helpers import CI
+from tinygrad.helpers import CI, getenv
 import numpy as np
 
 from extra.thunder.tiny.tk import WARP_THREADS
@@ -730,7 +730,8 @@ class TestTK(unittest.TestCase):
       attn_flops = 2 * B * H * N * N * D + \
                    4 * B * H * N * N + \
                    2 * B * H * N * N * D
-      print(f"{attn_flops/(et*1e9):2f} GFLOPS")
+      if getenv("TK_BENCH"):
+        print(f"{attn_flops/(et*1e9):2f} GFLOPS")
     out = out.float()
 
     q_permuted = q.permute(0, 2, 1, 3)
@@ -761,7 +762,8 @@ class TestTK(unittest.TestCase):
       attn_flops = 2 * B * H * N * N * D + \
                    4 * B * H * N * N + \
                    2 * B * H * N * N * D
-      print(f"{attn_flops/(et*1e9):2f} GFLOPS")
+      if getenv("TK_BENCH"):
+        print(f"{attn_flops/(et*1e9):2f} GFLOPS")
     out = out.float()
 
     ref = q.scaled_dot_product_attention(k, v, is_causal=True, enable_gqa=True).float()
