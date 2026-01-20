@@ -220,11 +220,11 @@ class RTBaseShape(BaseShape):
   def num_strides(self):
     return self.elements_per_thread // self.stride
 
-RT_16X16 = RTBaseShape(rows=16, cols=16, stride=4)
+RT_16X16 = RTBaseShape(rows=16, cols=16, stride=8 if WARP_THREADS == 32 else 4)
 RT_32X32 = RTBaseShape(rows=32, cols=32, stride=4)
 RT_32X32_8 = RTBaseShape(rows=32, cols=32, stride=8)
-RT_16X32 = RTBaseShape(rows=16, cols=32, stride=8)
-RT_32X16 = RTBaseShape(rows=32, cols=16, stride=8)
+RT_16X32 = RTBaseShape(rows=16, cols=32, stride=16 if WARP_THREADS == 32 else 8)
+RT_32X16 = RTBaseShape(rows=32, cols=16, stride=16 if WARP_THREADS == 32 else 8)
 RT_32X16_4 = RTBaseShape(rows=32, cols=16, stride=4)
 RT_16X32_4 = RTBaseShape(rows=16, cols=32, stride=4)
 

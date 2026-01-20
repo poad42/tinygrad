@@ -78,26 +78,42 @@ class Group:
     assert self.warps == 1
 
     a_base_shape = cast(RT, a).base_shape
+    upcast_4, upcast_8 = ((4, 2), (3, 2)), ((4, 2), (3, 2), (2, 2))
+    wmma_arg_16 = ('WMMA_16_16_16___bf16_float', (16, 16, 16), dtypes.bfloat16, dtypes.float, 'AMD', WARP_THREADS,
+      ((upcast_8, upcast_8, upcast_8) if WARP_THREADS == 32 else (upcast_4, upcast_4, upcast_4)), ()) # type: ignore
+
+    split_k = False
     if a_base_shape.cols == 16:
-      wmma_arg = ('WMMA_16_16_16___bf16_float', (16, 16, 16), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2)), ((4, 2), (3, 2)), ((4, 2), (3, 2))), ()) # type: ignore
+      wmma_arg = wmma_arg_16
     elif a_base_shape.cols == 32:
-      wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2))), ()) # type: ignore
-    else: raise NotImplementedError(f"mma_AB not implemented for {a_base_shape.cols=}")
+      # gfx12 wave32 only exposes 16x16x16 WMMA builtins; implement 16x16x32 as two 16x16x16 ops.
+      if WARP_THREADS == 32:
+        wmma_arg, split_k = wmma_arg_16, True
+      else:
+        wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), dtypes.bfloat16, dtypes.float, 'AMD', WARP_THREADS,
+          (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), upcast_4), ()) # type: ignore
+    else:
+      raise NotImplementedError(f"mma_AB not implemented for {a_base_shape.cols=}")
+
+    out_sz = 8 if WARP_THREADS == 32 else 4
+    in_sz = out_sz
 
     for height in self.ker.range(c.shape[-3], track=False):
       for width in self.ker.range(c.shape[-2], track=False):
         for inner in self.ker.range(a.shape[-2], axis_type=AxisType.REDUCE, track=False):
-          if a_base_shape.cols == 16:
-            a_in = UOp.vectorize(*[a[height, inner, i] for i in range(4)])
-            b_in = UOp.vectorize(*[b[inner, width, i] for i in range(4)])
-          elif a_base_shape.cols == 32:
-            a_in = UOp.vectorize(*[a[height, inner, i] for i in range(8)])
-            b_in = UOp.vectorize(*[b[inner, width, i] for i in range(8)])
-          else: raise NotImplementedError(f"mma_AB not implemented for {a_base_shape.cols=}")
-          d_in = UOp.vectorize(*[c[height, width, i] for i in range(4)])
-
-          out = UOp(Ops.WMMA, dtypes.float32.vec(4), (a_in, b_in, d_in), arg=wmma_arg)
-          c_i = [c[height, width, i].store(out.gep(i)) for i in range(4)]
+          d_in = UOp.vectorize(*[c[height, width, i] for i in range(out_sz)])
+          if split_k:
+            a0 = UOp.vectorize(*[a[height, inner, i].bitcast(dtypes.short) for i in range(in_sz)])
+            b0 = UOp.vectorize(*[b[inner, width, i].bitcast(dtypes.short) for i in range(in_sz)])
+            a1 = UOp.vectorize(*[a[height, inner, i+in_sz].bitcast(dtypes.short) for i in range(in_sz)])
+            b1 = UOp.vectorize(*[b[inner, width, i+in_sz].bitcast(dtypes.short) for i in range(in_sz)])
+            out = UOp(Ops.WMMA, dtypes.float32.vec(out_sz), (a0, b0, d_in), arg=wmma_arg)
+            out = UOp(Ops.WMMA, dtypes.float32.vec(out_sz), (a1, b1, out), arg=wmma_arg)
+          else:
+            a_in = UOp.vectorize(*[a[height, inner, i].bitcast(dtypes.short) for i in range(in_sz)])
+            b_in = UOp.vectorize(*[b[inner, width, i].bitcast(dtypes.short) for i in range(in_sz)])
+            out = UOp(Ops.WMMA, dtypes.float32.vec(out_sz), (a_in, b_in, d_in), arg=wmma_arg)
+          c_i = [c[height, width, i].store(out.gep(i)) for i in range(out_sz)]
           c_store = UOp.group(*c_i).end(height, width, inner)
 
     self.ker.push_store(c_store, c)
@@ -108,26 +124,41 @@ class Group:
     assert self.warps == 1
 
     a_base_shape = cast(RT, a).base_shape
+    upcast_4, upcast_8 = ((4, 2), (3, 2)), ((4, 2), (3, 2), (2, 2))
+    wmma_arg_16 = ('WMMA_16_16_16___bf16_float', (16, 16, 16), dtypes.bfloat16, dtypes.float, 'AMD', WARP_THREADS,
+      ((upcast_8, upcast_8, upcast_8) if WARP_THREADS == 32 else (upcast_4, upcast_4, upcast_4)), ()) # type: ignore
+
+    split_k = False
     if a_base_shape.cols == 16:
-      wmma_arg = ('WMMA_16_16_16___bf16_float', (16, 16, 16), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2)), ((4, 2), (3, 2)), ((4, 2), (3, 2))), ()) # type: ignore
+      wmma_arg = wmma_arg_16
     elif a_base_shape.cols == 32:
-      wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2))), ()) # type: ignore
-    else: raise NotImplementedError(f"mma_ABt not implemented for {a_base_shape.cols=}")
+      if WARP_THREADS == 32:
+        wmma_arg, split_k = wmma_arg_16, True
+      else:
+        wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), dtypes.bfloat16, dtypes.float, 'AMD', WARP_THREADS,
+          (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), upcast_4), ()) # type: ignore
+    else:
+      raise NotImplementedError(f"mma_ABt not implemented for {a_base_shape.cols=}")
+
+    out_sz = 8 if WARP_THREADS == 32 else 4
+    in_sz = out_sz
 
     for height in self.ker.range(c.shape[-3], track=False):
       for width in self.ker.range(c.shape[-2], track=False):
         for inner in self.ker.range(a.shape[-2], axis_type=AxisType.REDUCE, track=False):
-          if a_base_shape.cols == 16:
-            a_in = UOp.vectorize(*[a[height, inner, i] for i in range(4)])
-            b_in = UOp.vectorize(*[b[width, inner, i] for i in range(4)])
-          elif a_base_shape.cols == 32:
-            a_in = UOp.vectorize(*[a[height, inner, i] for i in range(8)])
-            b_in = UOp.vectorize(*[b[width, inner, i] for i in range(8)])
-          else: raise NotImplementedError(f"mma_ABt not implemented for {a_base_shape.cols=}")
-          d_in = UOp.vectorize(*[c[height, width, i] for i in range(4)])
-
-          out = UOp(Ops.WMMA, dtypes.float32.vec(4), (a_in, b_in, d_in), arg=wmma_arg)
-          c_i = [c[height, width, i].store(out.gep(i)) for i in range(4)]
+          d_in = UOp.vectorize(*[c[height, width, i] for i in range(out_sz)])
+          if split_k:
+            a0 = UOp.vectorize(*[a[height, inner, i].bitcast(dtypes.short) for i in range(in_sz)])
+            b0 = UOp.vectorize(*[b[width, inner, i].bitcast(dtypes.short) for i in range(in_sz)])
+            a1 = UOp.vectorize(*[a[height, inner, i+in_sz].bitcast(dtypes.short) for i in range(in_sz)])
+            b1 = UOp.vectorize(*[b[width, inner, i+in_sz].bitcast(dtypes.short) for i in range(in_sz)])
+            out = UOp(Ops.WMMA, dtypes.float32.vec(out_sz), (a0, b0, d_in), arg=wmma_arg)
+            out = UOp(Ops.WMMA, dtypes.float32.vec(out_sz), (a1, b1, out), arg=wmma_arg)
+          else:
+            a_in = UOp.vectorize(*[a[height, inner, i].bitcast(dtypes.short) for i in range(in_sz)])
+            b_in = UOp.vectorize(*[b[width, inner, i].bitcast(dtypes.short) for i in range(in_sz)])
+            out = UOp(Ops.WMMA, dtypes.float32.vec(out_sz), (a_in, b_in, d_in), arg=wmma_arg)
+          c_i = [c[height, width, i].store(out.gep(i)) for i in range(out_sz)]
           c_store = UOp.group(*c_i).end(height, width, inner)
 
     self.ker.push_store(c_store, c)
@@ -138,26 +169,41 @@ class Group:
     assert self.warps == 1
 
     a_base_shape = cast(RT, a).base_shape
+    upcast_4, upcast_8 = ((4, 2), (3, 2)), ((4, 2), (3, 2), (2, 2))
+    wmma_arg_16 = ('WMMA_16_16_16___bf16_float', (16, 16, 16), dtypes.bfloat16, dtypes.float, 'AMD', WARP_THREADS,
+      ((upcast_8, upcast_8, upcast_8) if WARP_THREADS == 32 else (upcast_4, upcast_4, upcast_4)), ()) # type: ignore
+
+    split_k = False
     if a_base_shape.cols == 16:
-      wmma_arg = ('WMMA_16_16_16___bf16_float', (16, 16, 16), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2)), ((4, 2), (3, 2)), ((4, 2), (3, 2))), ()) # type: ignore
+      wmma_arg = wmma_arg_16
     elif a_base_shape.cols == 32:
-      wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2))), ()) # type: ignore
-    else: raise NotImplementedError(f"mma_AtB not implemented for {a_base_shape.cols=}")
+      if WARP_THREADS == 32:
+        wmma_arg, split_k = wmma_arg_16, True
+      else:
+        wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), dtypes.bfloat16, dtypes.float, 'AMD', WARP_THREADS,
+          (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), upcast_4), ()) # type: ignore
+    else:
+      raise NotImplementedError(f"mma_AtB not implemented for {a_base_shape.cols=}")
+
+    out_sz = 8 if WARP_THREADS == 32 else 4
+    in_sz = out_sz
 
     for height in self.ker.range(c.shape[-3], track=False):
       for width in self.ker.range(c.shape[-2], track=False):
         for inner in self.ker.range(a.shape[-3], axis_type=AxisType.REDUCE, track=False):
-          if a_base_shape.cols == 16:
-            a_in = UOp.vectorize(*[a[inner, height, i] for i in range(4)])
-            b_in = UOp.vectorize(*[b[inner, width, i] for i in range(4)])
-          elif a_base_shape.cols == 32:
-            a_in = UOp.vectorize(*[a[inner, height, i] for i in range(8)])
-            b_in = UOp.vectorize(*[b[inner, width, i] for i in range(8)])
-          else: raise NotImplementedError(f"mma_AtB not implemented for {a_base_shape.cols=}")
-          d_in = UOp.vectorize(*[c[height, width, i] for i in range(4)])
-
-          out = UOp(Ops.WMMA, dtypes.float32.vec(4), (a_in, b_in, d_in), arg=wmma_arg)
-          c_i = [c[height, width, i].store(out.gep(i)) for i in range(4)]
+          d_in = UOp.vectorize(*[c[height, width, i] for i in range(out_sz)])
+          if split_k:
+            a0 = UOp.vectorize(*[a[inner, height, i].bitcast(dtypes.short) for i in range(in_sz)])
+            b0 = UOp.vectorize(*[b[inner, width, i].bitcast(dtypes.short) for i in range(in_sz)])
+            a1 = UOp.vectorize(*[a[inner, height, i+in_sz].bitcast(dtypes.short) for i in range(in_sz)])
+            b1 = UOp.vectorize(*[b[inner, width, i+in_sz].bitcast(dtypes.short) for i in range(in_sz)])
+            out = UOp(Ops.WMMA, dtypes.float32.vec(out_sz), (a0, b0, d_in), arg=wmma_arg)
+            out = UOp(Ops.WMMA, dtypes.float32.vec(out_sz), (a1, b1, out), arg=wmma_arg)
+          else:
+            a_in = UOp.vectorize(*[a[inner, height, i].bitcast(dtypes.short) for i in range(in_sz)])
+            b_in = UOp.vectorize(*[b[inner, width, i].bitcast(dtypes.short) for i in range(in_sz)])
+            out = UOp(Ops.WMMA, dtypes.float32.vec(out_sz), (a_in, b_in, d_in), arg=wmma_arg)
+          c_i = [c[height, width, i].store(out.gep(i)) for i in range(out_sz)]
           c_store = UOp.group(*c_i).end(height, width, inner)
 
     self.ker.push_store(c_store, c)
@@ -168,26 +214,41 @@ class Group:
     assert self.warps == 1
 
     a_base_shape = cast(RT, a).base_shape
+    upcast_4, upcast_8 = ((4, 2), (3, 2)), ((4, 2), (3, 2), (2, 2))
+    wmma_arg_16 = ('WMMA_16_16_16___bf16_float', (16, 16, 16), dtypes.bfloat16, dtypes.float, 'AMD', WARP_THREADS,
+      ((upcast_8, upcast_8, upcast_8) if WARP_THREADS == 32 else (upcast_4, upcast_4, upcast_4)), ()) # type: ignore
+
+    split_k = False
     if a_base_shape.cols == 16:
-      wmma_arg = ('WMMA_16_16_16___bf16_float', (16, 16, 16), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2)), ((4, 2), (3, 2)), ((4, 2), (3, 2))), ()) # type: ignore
+      wmma_arg = wmma_arg_16
     elif a_base_shape.cols == 32:
-      wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2))), ()) # type: ignore
-    else: raise NotImplementedError(f"mma_AtBt not implemented for {a_base_shape.cols=}")
+      if WARP_THREADS == 32:
+        wmma_arg, split_k = wmma_arg_16, True
+      else:
+        wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), dtypes.bfloat16, dtypes.float, 'AMD', WARP_THREADS,
+          (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), upcast_4), ()) # type: ignore
+    else:
+      raise NotImplementedError(f"mma_AtBt not implemented for {a_base_shape.cols=}")
+
+    out_sz = 8 if WARP_THREADS == 32 else 4
+    in_sz = out_sz
 
     for height in self.ker.range(c.shape[-3], track=False):
       for width in self.ker.range(c.shape[-2], track=False):
         for inner in self.ker.range(a.shape[-3], axis_type=AxisType.REDUCE, track=False):
-          if a_base_shape.cols == 16:
-            a_in = UOp.vectorize(*[a[inner, height, i] for i in range(4)])
-            b_in = UOp.vectorize(*[b[width, inner, i] for i in range(4)])
-          elif a_base_shape.cols == 32:
-            a_in = UOp.vectorize(*[a[inner, height, i] for i in range(8)])
-            b_in = UOp.vectorize(*[b[width, inner, i] for i in range(8)])
-          else: raise NotImplementedError(f"mma_AtBt not implemented for {a_base_shape.cols=}")
-          d_in = UOp.vectorize(*[c[height, width, i] for i in range(4)])
-
-          out = UOp(Ops.WMMA, dtypes.float32.vec(4), (a_in, b_in, d_in), arg=wmma_arg)
-          c_i = [c[height, width, i].store(out.gep(i)) for i in range(4)]
+          d_in = UOp.vectorize(*[c[height, width, i] for i in range(out_sz)])
+          if split_k:
+            a0 = UOp.vectorize(*[a[inner, height, i].bitcast(dtypes.short) for i in range(in_sz)])
+            b0 = UOp.vectorize(*[b[width, inner, i].bitcast(dtypes.short) for i in range(in_sz)])
+            a1 = UOp.vectorize(*[a[inner, height, i+in_sz].bitcast(dtypes.short) for i in range(in_sz)])
+            b1 = UOp.vectorize(*[b[width, inner, i+in_sz].bitcast(dtypes.short) for i in range(in_sz)])
+            out = UOp(Ops.WMMA, dtypes.float32.vec(out_sz), (a0, b0, d_in), arg=wmma_arg)
+            out = UOp(Ops.WMMA, dtypes.float32.vec(out_sz), (a1, b1, out), arg=wmma_arg)
+          else:
+            a_in = UOp.vectorize(*[a[inner, height, i].bitcast(dtypes.short) for i in range(in_sz)])
+            b_in = UOp.vectorize(*[b[width, inner, i].bitcast(dtypes.short) for i in range(in_sz)])
+            out = UOp(Ops.WMMA, dtypes.float32.vec(out_sz), (a_in, b_in, d_in), arg=wmma_arg)
+          c_i = [c[height, width, i].store(out.gep(i)) for i in range(out_sz)]
           c_store = UOp.group(*c_i).end(height, width, inner)
 
     self.ker.push_store(c_store, c)
@@ -215,6 +276,10 @@ class Group:
     vec, src = cast(UOp, vec), cast(UOp, src)
     assert self.warps == 1
 
+    elements_per_thread = cast(RT, src).base_shape.elements_per_thread
+    reductions = cast(RT, src).base_shape.cols
+    reduce_steps = (self.group_threads // reductions) - 1
+
     red_local = self.ker.alloc((self.group_threads,), src.dtype.base, AddrSpace.LOCAL)
     red_reg = self.ker.alloc((1,), src.dtype.base, AddrSpace.REG)
 
@@ -226,7 +291,7 @@ class Group:
       red_reg = red_reg.after(reg_store).reshape(red_reg.shape)
 
       for width in self.ker.range(src.shape[-2], axis_type=AxisType.REDUCE, track=False):
-        for inner in self.ker.range(4, axis_type=AxisType.REDUCE, track=False):
+        for inner in self.ker.range(elements_per_thread, axis_type=AxisType.REDUCE, track=False):
           reg_store = red_reg[0].store(op(red_reg[0], src[height, width, inner])).end(width, inner)
           red_reg = red_reg.after(reg_store).reshape(red_reg.shape)
 
@@ -235,9 +300,9 @@ class Group:
       red_local = red_local.after(red_local_store.barrier()).reshape(red_local.shape)
 
       # reduce from shared memory
-      for inner in self.ker.range(3, axis_type=AxisType.REDUCE, track=False):
-        offset = (self.laneid + (1 + inner) * 16) % self.group_threads
-        reg_store = red_reg[0].store(op(red_reg[0], red_local[offset])).end(inner)
+      for step in self.ker.range(reduce_steps, axis_type=AxisType.REDUCE, track=False):
+        offset = (self.laneid + (1 + step) * reductions) % self.group_threads
+        reg_store = red_reg[0].store(op(red_reg[0], red_local[offset])).end(step)
         red_reg = red_reg.after(reg_store).reshape(red_reg.shape)
 
       # reduce with vec
@@ -250,6 +315,10 @@ class Group:
     vec, src = cast(UOp, vec), cast(UOp, src)
     assert self.warps == 1
 
+    elements_per_thread = cast(RT, src).base_shape.elements_per_thread
+    reductions = cast(RT, src).base_shape.rows
+    reduce_steps = (self.group_threads // reductions) - 1
+
     red_local = self.ker.alloc((self.group_threads,), src.dtype.base, AddrSpace.LOCAL)
     red_reg = self.ker.alloc((1,), src.dtype.base, AddrSpace.REG)
 
@@ -261,7 +330,7 @@ class Group:
       red_reg = red_reg.after(reg_store).reshape(red_reg.shape)
 
       for height in self.ker.range(src.shape[-3], axis_type=AxisType.REDUCE, track=False):
-        for inner in self.ker.range(4, axis_type=AxisType.REDUCE, track=False):
+        for inner in self.ker.range(elements_per_thread, axis_type=AxisType.REDUCE, track=False):
           reg_store = red_reg[0].store(op(red_reg[0], src[height, width, inner])).end(height, inner)
           red_reg = red_reg.after(reg_store).reshape(red_reg.shape)
 
@@ -270,9 +339,9 @@ class Group:
       red_local = red_local.after(red_local_store.barrier()).reshape(red_local.shape)
 
       # reduce from shared memory
-      for inner in self.ker.range(3, axis_type=AxisType.REDUCE, track=False):
-        offset = (self.laneid + (1 + inner) * 16) % self.group_threads
-        reg_store = red_reg[0].store(op(red_reg[0], red_local[offset])).end(inner)
+      for step in self.ker.range(reduce_steps, axis_type=AxisType.REDUCE, track=False):
+        offset = (self.laneid + (1 + step) * reductions) % self.group_threads
+        reg_store = red_reg[0].store(op(red_reg[0], red_local[offset])).end(step)
         red_reg = red_reg.after(reg_store).reshape(red_reg.shape)
 
       # reduce with vec
