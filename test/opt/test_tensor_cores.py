@@ -11,9 +11,10 @@ from tinygrad.helpers import AMX, AMD_LLVM, CPU_LLVM, Context
 from test.helpers import slow
 from tinygrad.engine.realize import CompiledRunner, get_program
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.codegen.opt.tc import amd_cdna_1616128
 
 # TODO: write a clean version of this
-from test.test_linearizer import helper_realized_ast, helper_linearizer_opt
+from test.backend.test_linearizer import helper_realized_ast, helper_linearizer_opt
 
 # NOTE: get_program always passes in Device[Device.DEFAULT].renderer explicitly for process_replay!!!
 
@@ -120,7 +121,7 @@ class TestTensorCores(unittest.TestCase):
       # check excessive padding doesn't trigger padded TC in TC_OPT=2
       helper_tc_ensure_uops_and_opts_count(tc.dims[0]//4, tc.dims[1], tc.dims[2], tc.dtype_in, tc.dtype_out, tc_opt=2, ensure_triggered=False)
       helper_tc_ensure_uops_and_opts_count(tc.dims[0], tc.dims[1]//4, tc.dims[2], tc.dtype_in, tc.dtype_out, tc_opt=2, ensure_triggered=False)
-      if not AMX: # AMX tc.dims[2] == 1
+      if not AMX and tc not in amd_cdna_1616128: # AMX tc.dims[2] == 1
         helper_tc_ensure_uops_and_opts_count(tc.dims[0], tc.dims[1], tc.dims[2]//8, tc.dtype_in, tc.dtype_out, tc_opt=2, ensure_triggered=False)
 
   @Context(ALLOW_TF32=1)
@@ -148,10 +149,10 @@ class TestTensorCores(unittest.TestCase):
         if _to_np_dtype(real_bufs[0].dtype) is None: continue
         real_bufs[0].copyin(np.zeros((real_bufs[0].size, ), dtype=_to_np_dtype(real_bufs[0].dtype)).data) # Zero to check that all values are filled
         prg.exec(real_bufs)
-        result = np.frombuffer(real_bufs[0].as_buffer(), _to_np_dtype(real_bufs[0].dtype))
+        result = np.frombuffer(real_bufs[0].as_memoryview(), _to_np_dtype(real_bufs[0].dtype))
 
         # ensure the results for each choice of axis matches
-        if golden_result is None: golden_result = np.frombuffer(real_bufs[0].as_buffer(), _to_np_dtype(real_bufs[0].dtype))
+        if golden_result is None: golden_result = np.frombuffer(real_bufs[0].as_memoryview(), _to_np_dtype(real_bufs[0].dtype))
         np.testing.assert_allclose(result, golden_result, atol=0.1, rtol=0.2)
 
   @Context(ALLOW_TF32=1)

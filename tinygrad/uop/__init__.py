@@ -14,7 +14,7 @@ class Ops(FastEnum):
   # ** 1 -- defines/special **
 
   # define GLOBAL/VAR are ptrs to outside the Kernel
-  DEFINE_GLOBAL = auto(); DEFINE_VAR = auto(); BIND = auto()
+  DEFINE_VAR = auto(); BIND = auto()
 
   # this is a RANGE for GPU dimensions, similar to symbolic shapes but not exactly
   SPECIAL = auto()
@@ -26,6 +26,11 @@ class Ops(FastEnum):
 
   # uops that aren't rendered
   NOOP = auto(); REWRITE_ERROR = auto()
+  PARAM = auto(); CALL = auto()
+
+  # renderer
+  # LINEAR is a list of UOps, SOURCE has a str arg that's human readable, BINARY has bytes arg that's compiled
+  PROGRAM = auto(); LINEAR = auto(); SOURCE = auto(); BINARY = auto()
 
   # AFTER passes src[0] through and promises in the toposort that any consumers of the AFTER run after src[1:]
   # GROUP is a NOOP that just merges things together
@@ -71,11 +76,13 @@ class Ops(FastEnum):
   # CUSTOM/CUSTOMI are used to output strings into codegen. the I makes the string inline
   CUSTOM = auto(); CUSTOMI = auto()
 
+  # INS is a machine instruction
+  INS = auto()
+
   # ** 6 -- ops that don't exist in programs **
 
   # tensor graph ops
-  UNIQUE = auto(); DEVICE = auto(); KERNEL = auto(); ASSIGN = auto()
-  CUSTOM_KERNEL = auto()
+  UNIQUE = auto(); DEVICE = auto(); ASSIGN = auto()
 
   # local unique
   LUNIQUE = auto()
@@ -106,7 +113,7 @@ class GroupOp:
   # TODO: is BITCAST always Elementwise if it's shape changing?
   Elementwise = set.union(ALU, {Ops.CAST, Ops.BITCAST})
 
-  Defines = {Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL, Ops.DEFINE_REG}
+  Defines = {Ops.PARAM, Ops.DEFINE_LOCAL, Ops.DEFINE_REG}
 
   Irreducible = {Ops.CONST, Ops.DEFINE_VAR, Ops.SPECIAL, Ops.RANGE}
   Movement = {Ops.RESHAPE, Ops.EXPAND, Ops.PERMUTE, Ops.PAD, Ops.SHRINK, Ops.FLIP}

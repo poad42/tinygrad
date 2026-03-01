@@ -12,7 +12,7 @@ class _tk_range:
   def __next__(self):
     if not self.done:
       self.done = True
-      self._rng = UOp.range(self.end // self.step, self.rid, axis_type=self.axis_type) * self.step + self.start
+      self._rng = UOp.range((self.end - self.start) // self.step, self.rid, axis_type=self.axis_type) * self.step + self.start
       return self._rng
     raise StopIteration
 
@@ -53,6 +53,11 @@ class Kernel(AbstractContextManager):
     rng = _tk_range(start, end, step, axis_type, self.range_id)
     self.range_id += 1
     if track: self.range_stack.append(rng)
+    return rng
+
+  def raw_range(self, end:int=0, axis_type:AxisType=AxisType.LOOP):
+    rng = UOp.range(end, self.range_id, axis_type=axis_type)
+    self.range_id += 1
     return rng
 
   def alloc(self, shape, dtype, addrspace:AddrSpace, name:str|None=None):

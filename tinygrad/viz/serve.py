@@ -1,24 +1,55 @@
 #!/usr/bin/env python3
 import multiprocessing, pickle, difflib, os, threading, json, time, sys, webbrowser, socket, argparse, functools, codecs, io, struct
-import ctypes, pathlib, traceback, itertools
+import pathlib, traceback, itertools, socketserver
 from contextlib import redirect_stdout, redirect_stderr, contextmanager
 from decimal import Decimal
 from urllib.parse import parse_qs, urlparse
+from http.server import BaseHTTPRequestHandler
 from typing import Any, TypedDict, TypeVar, Generator, Callable
 from tinygrad.helpers import colored, getenv, tqdm, unwrap, word_wrap, TRACEMETA, ProfileEvent, ProfileRangeEvent, TracingKey, ProfilePointEvent, temp
-from tinygrad.helpers import printable, system, TCPServerWithReuse, HTTPRequestHandler
+from tinygrad.helpers import printable, Context
+from tinygrad.renderer.amd.dsl import Inst
+from tinygrad.renderer.amd import detect_format
+
+# NOTE: using HTTPServer forces a potentially slow socket.getfqdn
+class TCPServerWithReuse(socketserver.TCPServer):
+  allow_reuse_address = True
+  def __init__(self, server_address, RequestHandlerClass):
+    print(f"*** started server on http://127.0.0.1:{server_address[1]}")
+    super().__init__(server_address, RequestHandlerClass)
+
+class HTTPRequestHandler(BaseHTTPRequestHandler):
+  def send_data(self, data:bytes, content_type:str="application/json", status_code:int=200):
+    self.send_response(status_code)
+    self.send_header("Content-Type", content_type)
+    self.send_header("Content-Length", str(len(data)))
+    self.end_headers()
+    return self.wfile.write(data)
+  def stream_json(self, source:Generator):
+    try:
+      self.send_response(200)
+      self.send_header("Content-Type", "text/event-stream")
+      self.send_header("Cache-Control", "no-cache")
+      self.end_headers()
+      for r in source:
+        self.wfile.write(f"data: {json.dumps(r)}\n\n".encode("utf-8"))
+        self.wfile.flush()
+      self.wfile.write("data: [DONE]\n\n".encode("utf-8"))
+    # pass if client closed connection
+    except (BrokenPipeError, ConnectionResetError): return
+
 from tinygrad.uop.ops import TrackedGraphRewrite, RewriteTrace, UOp, Ops, GroupOp, srender, sint, sym_infer, range_str, pyrender
 from tinygrad.uop.ops import print_uops, range_start, multirange_str
-from tinygrad.device import ProfileDeviceEvent, ProfileGraphEvent, ProfileGraphEntry, Device, ProfileProgramEvent
-from tinygrad.renderer import ProgramSpec
+from tinygrad.device import ProfileDeviceEvent, ProfileGraphEvent, ProfileGraphEntry, ProfileProgramEvent
 from tinygrad.dtype import dtypes
 
 uops_colors = {Ops.LOAD: "#ffc0c0", Ops.STORE: "#87CEEB", Ops.CONST: "#e0e0e0", Ops.VCONST: "#e0e0e0", Ops.REDUCE: "#FF5B5B",
-               Ops.DEFINE_GLOBAL:"#cb9037", **{x:"#f2cb91" for x in {Ops.DEFINE_LOCAL, Ops.DEFINE_REG}}, Ops.REDUCE_AXIS: "#FF6B6B",
+               **{x:"#f2cb91" for x in {Ops.DEFINE_LOCAL, Ops.DEFINE_REG}}, Ops.REDUCE_AXIS: "#FF6B6B",
                Ops.RANGE: "#c8a0e0", Ops.ASSIGN: "#909090", Ops.BARRIER: "#ff8080", Ops.IF: "#c8b0c0", Ops.SPECIAL: "#c0c0ff",
-               Ops.INDEX: "#cef263", Ops.WMMA: "#efefc0", Ops.MULTI: "#f6ccff", Ops.KERNEL: "#3e7f55", Ops.CUSTOM_KERNEL: "#3ebf55",
+               Ops.INDEX: "#cef263", Ops.WMMA: "#efefc0", Ops.MULTI: "#f6ccff", Ops.INS: "#eec4ff",
                **{x:"#D8F9E4" for x in GroupOp.Movement}, **{x:"#ffffc0" for x in GroupOp.ALU}, Ops.THREEFRY:"#ffff80",
                Ops.BUFFER_VIEW: "#E5EAFF", Ops.BUFFER: "#B0BDFF", Ops.COPY: "#a040a0", Ops.ENCDEC: "#bf71b6",
+               Ops.CALL: "#00B7C8", Ops.PARAM: "#14686F", Ops.SOURCE: "#c0c0c0", Ops.LINEAR: "#808080", Ops.BINARY: "#404040",
                Ops.ALLREDUCE: "#ff40a0", Ops.MSELECT: "#d040a0", Ops.MSTACK: "#d040a0", Ops.CONTIGUOUS: "#FFC14D",
                Ops.BUFFERIZE: "#FF991C", Ops.REWRITE_ERROR: "#ff2e2e", Ops.AFTER: "#8A7866", Ops.END: "#524C46"}
 
@@ -39,10 +70,11 @@ def get_rewrites(t:RewriteTrace) -> list[dict]:
   for i,(k,v) in enumerate(zip(t.keys, t.rewrites)):
     steps = [create_step(s.name, ("/graph-rewrites", i, j), loc=s.loc, match_count=len(s.matches), code_line=printable(s.loc),
                          trace=k.tb if j==0 else None, depth=s.depth) for j,s in enumerate(v)]
-    if isinstance(k.ret, ProgramSpec):
-      steps.append(create_step("View UOp List", ("/uops", i, len(steps)), k.ret))
-      steps.append(create_step("View Program", ("/code", i, len(steps)), k.ret))
-      steps.append(create_step("View Disassembly", ("/asm", i, len(steps)), k.ret))
+    if (p:=get_prg_uop(i)) is not None:
+      _, __, lin, src, binary = p.src
+      steps.append(create_step("View UOp List", ("/uops", i, len(steps)), lin.src))
+      steps.append(create_step("View Source", ("/code", i, len(steps)), src.arg))
+      steps.append(create_step("View Disassembly", ("/asm", i, len(steps)), (k.ret, binary.arg)))
     for key in k.keys: ref_map[key] = i
     ret.append({"name":k.display_name, "steps":steps})
   return ret
@@ -63,6 +95,8 @@ def pystr(u:UOp) -> str:
   try: return pyrender(u)
   except Exception: return str(u)
 
+# all the trace points, initialized after the trace loads
+ctxs:list[dict] = []
 def uop_to_json(x:UOp) -> dict[int, dict]:
   assert isinstance(x, UOp)
   graph: dict[int, dict] = {}
@@ -72,26 +106,32 @@ def uop_to_json(x:UOp) -> dict[int, dict]:
     if u.op in {Ops.DEVICE, Ops.CONST, Ops.UNIQUE, Ops.LUNIQUE} and u is not x: excluded.add(u)
     if u.op is Ops.VCONST and u.dtype.scalar() == dtypes.index and u is not x: excluded.add(u)
     if u.op is Ops.VECTORIZE and len(u.src) == 0: excluded.add(u)
+    # exclude RESHAPE/EXPAND that only serve to broadcast a CONST
+    if u.op in {Ops.RESHAPE, Ops.EXPAND} and len(u.src) >= 1 and u.src[0] in excluded and u is not x: excluded.add(u)
   for u in toposort:
     if u in excluded: continue
     argst = codecs.decode(str(u.arg), "unicode_escape")
     if u.op in GroupOp.Movement: argst = (mask_to_str if u.op in {Ops.SHRINK, Ops.PAD} else shape_to_str)(u.marg)
-    if u.op is Ops.KERNEL:
-      ast_str = f"SINK{tuple(s.op for s in u.arg.ast.src)}" if u.arg.ast.op is Ops.SINK else repr(u.arg.ast.op)
-      argst = f"<Kernel {len(list(u.arg.ast.toposort()))} {ast_str} {[str(m) for m in u.arg.metadata]}>"
-    label = f"{str(u.op).split('.')[1]}{(chr(10)+word_wrap(argst.replace(':', ''))) if u.arg is not None else ''}"
+    if u.op is Ops.BINARY: argst = f"<{len(u.arg)} bytes>"
+    wrap_len = 200 if u.op is Ops.SOURCE else 80
+    label = f"{str(u.op).split('.')[1]}{(chr(10)+word_wrap(argst.replace(':', ''), wrap=wrap_len)) if u.arg is not None else ''}"
     if u.dtype != dtypes.void: label += f"\n{u.dtype}"
     for idx,x in enumerate(u.src[:1] if u.op in {Ops.BUFFERIZE, Ops.INDEX} else (u.src if u.op is not Ops.END else [])):
       if x in excluded:
-        arg = f"{x.arg:g}" if x.op is Ops.CONST and dtypes.is_float(x.dtype) else f"{x.arg}"
-        label += f"\n{x.op.name}{idx} {arg}" + (f" {x.src[0].op}" if len(x.src) else "")
+        # walk through excluded movement ops to find the underlying CONST
+        cx = x
+        while cx.op in GroupOp.Movement and len(cx.src) >= 1 and cx.src[0] in excluded: cx = cx.src[0]
+        arg = f"{cx.arg:g}" if cx.op is Ops.CONST and dtypes.is_float(cx.dtype) else f"{cx.arg}"
+        label += f"\n{cx.op.name}{idx} {arg}" + (f" {cx.src[0].op}" if len(cx.src) else "")
     try:
       if len(rngs:=u.ranges):
         label += f"\n({multirange_str(rngs, color=True)})"
       if u._shape is not None:
         label += f"\n{shape_to_str(u.shape)}"
+      if u.op is Ops.CALL:
+        label += f"\n{u.src[0].key.hex()[:8]}"
       if u.op in {Ops.INDEX, Ops.BUFFERIZE}:
-        label += f"\n{u.render()}"
+        if len(u.toposort()) < 30: label += f"\n{u.render()}"
         ranges: list[UOp] = []
         for us in u.src[1:]: ranges += [s for s in us.toposort() if s.op in {Ops.RANGE, Ops.SPECIAL}]
         if ranges: label += "\n"+' '.join([f"{s.render()}={s.vmax+1}" for s in ranges])
@@ -99,9 +139,12 @@ def uop_to_json(x:UOp) -> dict[int, dict]:
         label += "\n"+' '.join([f"{range_str(s, color=True)}({s.vmax+1})" for s in trngs])
     except Exception:
       label += "\n<ISSUE GETTING LABEL>"
-    if (ref:=ref_map.get(u.arg.ast) if u.op is Ops.KERNEL else None) is not None: label += f"\ncodegen@{ctxs[ref]['name']}"
+    if (ref:=ref_map.get(u.src[0]) if u.op is Ops.CALL else None) is not None and ctxs: label += f"\ncodegen@{ctxs[ref]['name']}"
     # NOTE: kernel already has metadata in arg
-    if TRACEMETA >= 2 and u.metadata is not None and u.op is not Ops.KERNEL: label += "\n"+str(u.metadata)
+    if TRACEMETA >= 2 and u.metadata is not None and u.op is not Ops.CALL: label += "\n"+str(u.metadata)
+    # limit SOURCE labels line count
+    if u.op is Ops.SOURCE and len(lines:=label.split("\n")) > 40:
+      label = "\n".join(lines[:30]) + "\n..."
     graph[id(u)] = {"label":label, "src":[(i,id(x)) for i,x in enumerate(u.src) if x not in excluded], "color":uops_colors.get(u.op, "#ffffff"),
                     "ref":ref, "tag":repr(u.tag) if u.tag is not None else None}
   return graph
@@ -109,12 +152,10 @@ def uop_to_json(x:UOp) -> dict[int, dict]:
 @functools.cache
 def _reconstruct(a:int):
   op, dtype, src, arg, *rest = trace.uop_fields[a]
-  arg = type(arg)(_reconstruct(arg.ast), arg.metadata) if op is Ops.KERNEL else arg
   return UOp(op, dtype, tuple(_reconstruct(s) for s in src), arg, *rest)
 
 def get_full_rewrite(ctx:TrackedGraphRewrite) -> Generator[GraphRewriteDetails, None, None]:
   next_sink = _reconstruct(ctx.sink)
-  # in the schedule graph we don't show indexing ops (unless it's in a kernel AST or rewriting dtypes.index sink)
   yield {"graph":uop_to_json(next_sink), "uop":pystr(next_sink), "change":None, "diff":None, "upat":None}
   replaces: dict[UOp, UOp] = {}
   for u0_num,u1_num,upat_loc,dur in tqdm(ctx.matches):
@@ -126,6 +167,10 @@ def get_full_rewrite(ctx:TrackedGraphRewrite) -> Generator[GraphRewriteDetails, 
            "diff":list(difflib.unified_diff(pystr(u0).splitlines(), pystr(u1).splitlines())), "upat":(upat_loc, match_repr)}
     if not ctx.bottom_up: next_sink = new_sink
 
+def get_prg_uop(i:int) -> UOp|None:
+  s = next((s for s in trace.rewrites[i] if s.name == "View Program"), None)
+  return _reconstruct(s.sink) if s is not None else None
+
 # encoder helpers
 
 def enum_str(s, cache:dict[str, int]) -> int:
@@ -135,19 +180,24 @@ def enum_str(s, cache:dict[str, int]) -> int:
 
 def option(s:int|None) -> int: return 0 if s is None else s+1
 
+def rel_ts(ts:int|Decimal, start_ts:int) -> int:
+  val = int(ts) - start_ts
+  if val < 0 or val > 0xFFFFFFFF: raise ValueError(f"timestamp out of range: ts={ts} start={start_ts} {val}")
+  return val
+
 # Profiler API
 
-device_ts_diffs:dict[str, tuple[Decimal, Decimal]] = {}
-def cpu_ts_diff(device:str, thread=0) -> Decimal: return device_ts_diffs.get(device, (Decimal(0),))[thread]
+device_ts_diffs:dict[str, Decimal] = {}
+def cpu_ts_diff(device:str) -> Decimal: return device_ts_diffs.get(device, Decimal(0))
 
 DevEvent = ProfileRangeEvent|ProfileGraphEntry|ProfilePointEvent
 def flatten_events(profile:list[ProfileEvent]) -> Generator[tuple[Decimal, Decimal, DevEvent], None, None]:
   for e in profile:
-    if isinstance(e, ProfileRangeEvent): yield (e.st+(diff:=cpu_ts_diff(e.device, e.is_copy)), (e.en if e.en is not None else e.st)+diff, e)
+    if isinstance(e, ProfileRangeEvent): yield (e.st+(diff:=cpu_ts_diff(e.device)), (e.en if e.en is not None else e.st)+diff, e)
     elif isinstance(e, ProfilePointEvent): yield (e.ts, e.ts, e)
     elif isinstance(e, ProfileGraphEvent):
       cpu_ts = []
-      for ent in e.ents: cpu_ts += [e.sigs[ent.st_id]+(diff:=cpu_ts_diff(ent.device, ent.is_copy)), e.sigs[ent.en_id]+diff]
+      for ent in e.ents: cpu_ts += [e.sigs[ent.st_id]+(diff:=cpu_ts_diff(ent.device)), e.sigs[ent.en_id]+diff]
       yield (st:=min(cpu_ts)), (et:=max(cpu_ts)), ProfileRangeEvent(f"{e.ents[0].device.split(':')[0]} Graph", f"batched {len(e.ents)}", st, et)
       for i,ent in enumerate(e.ents): yield (cpu_ts[i*2], cpu_ts[i*2+1], ent)
 
@@ -159,11 +209,11 @@ def timeline_layout(dev_events:list[tuple[int, int, float, DevEvent]], start_ts:
     if isinstance(e, ProfilePointEvent) and e.name == "exec": exec_points[e.arg["name"]] = e
     if dur == 0: continue
     name, fmt, key = e.name, [], None
-    if (ref:=ref_map.get(name)) is not None:
+    if (ref:=ref_map.get(name)) is not None and ctxs:
       name = ctxs[ref]["name"]
-      if isinstance(p:=trace.keys[ref].ret, ProgramSpec) and (ei:=exec_points.get(p.name)) is not None:
-        flops = sym_infer(p.estimates.ops, var_vals:=ei.arg['var_vals'])/(t:=dur*1e-6)
-        membw, ldsbw = sym_infer(p.estimates.mem, var_vals)/t, sym_infer(p.estimates.lds, var_vals)/t
+      if (p:=get_prg_uop(ref)) is not None and (ei:=exec_points.get(p.src[0].arg.name)) is not None:
+        flops = sym_infer((estimates:=p.src[0].arg.estimates).ops, var_vals:=ei.arg['var_vals'])/(t:=dur*1e-6)
+        membw, ldsbw = sym_infer(estimates.mem, var_vals)/t, sym_infer(estimates.lds, var_vals)/t
         fmt = [f"{flops*1e-9:.0f} GFLOPS" if flops < 1e14 else f"{flops*1e-12:.0f} TFLOPS",
               (f"{membw*1e-9:.0f} GB/s" if membw < 1e13 else f"{membw*1e-12:.0f} TB/s")+" mem",
               (f"{ldsbw*1e-9:.0f} GB/s" if ldsbw < 1e15 else f"{ldsbw*1e-12:.0f} TB/s")+" lds"]
@@ -173,7 +223,11 @@ def timeline_layout(dev_events:list[tuple[int, int, float, DevEvent]], start_ts:
     elif isinstance(e.name, TracingKey):
       name = e.name.display_name
       ref = next((v for k in e.name.keys if (v:=ref_map.get(k)) is not None), None)
-    events.append(struct.pack("<IIIIfI", enum_str(name, scache), option(ref), option(key), st-start_ts, dur, enum_str("\n".join(fmt), scache)))
+      if isinstance(e.name.ret, str): fmt.append(e.name.ret)
+      elif isinstance(e.name.ret, int):
+        membw = e.name.ret / (dur * 1e-6)
+        fmt.append(f"{membw*1e-9:.0f} GB/s" if membw < 1e13 else f"{membw*1e-12:.0f} TB/s")
+    events.append(struct.pack("<IIIIfI", enum_str(name, scache), option(ref), option(key), rel_ts(st,start_ts), dur, enum_str("\n".join(fmt),scache)))
   return struct.pack("<BI", 0, len(events))+b"".join(events) if events else None
 
 def encode_mem_free(key:int, ts:int, execs:list[ProfilePointEvent], scache:dict) -> bytes:
@@ -195,7 +249,7 @@ def mem_layout(dev_events:list[tuple[int, int, float, DevEvent]], start_ts:int, 
     if not isinstance(e, ProfilePointEvent): continue
     if e.name == "alloc":
       safe_sz = min(1_000_000_000_000, e.arg["sz"])
-      events.append(struct.pack("<BIIIQ", 1, int(e.ts)-start_ts, e.key, enum_str(e.arg["dtype"].name, scache), safe_sz))
+      events.append(struct.pack("<BIIIQ", 1, rel_ts(e.ts, start_ts), e.key, enum_str(e.arg["dtype"].name, scache), safe_sz))
       dtype_size.setdefault(e.arg["dtype"].name, e.arg["dtype"].itemsize)
       temp[e.key] = nbytes = safe_sz*e.arg["dtype"].itemsize
       mem += nbytes
@@ -203,9 +257,9 @@ def mem_layout(dev_events:list[tuple[int, int, float, DevEvent]], start_ts:int, 
     if e.name == "exec" and e.arg["bufs"]:
       for b in e.arg["bufs"]: buf_ei.setdefault(b, []).append(e)
     if e.name == "free":
-      events.append(encode_mem_free(e.key, int(e.ts) - start_ts, buf_ei.pop(e.key, []), scache))
+      events.append(encode_mem_free(e.key, rel_ts(e.ts, start_ts), buf_ei.pop(e.key, []), scache))
       mem -= temp.pop(e.key)
-  for t in temp: events.append(encode_mem_free(t, end_ts-start_ts, buf_ei.pop(t, []), scache))
+  for t in temp: events.append(encode_mem_free(t, rel_ts(end_ts, start_ts), buf_ei.pop(t, []), scache))
   peaks.append(peak)
   return struct.pack("<BIQ", 1, len(events), peak)+b"".join(events) if events else None
 
@@ -216,63 +270,109 @@ def soft_err(fn:Callable):
   try: yield
   except Exception: fn({"src":traceback.format_exc()})
 
-def row_tuple(row:str) -> tuple[int, ...]: return tuple(int(x.split(":")[1]) for x in row.split())
+def row_tuple(row:str) -> tuple[tuple[int, int], ...]:
+  return tuple((ord(ss[0][0]), int(ss[1])) if len(ss:=x.split(":"))>1 else (999,999) for x in row.split())
 
 # *** Performance counters
+
+metrics:dict[str, Callable[[dict[str, tuple[int, int, int]]], str]] = {
+  "VALU utilization": lambda s: f"{100 * (s['SQ_INSTS_VALU'][0] / s['SQ_INSTS_VALU'][2]) / (s['GRBM_GUI_ACTIVE'][1] * 4):.1f}%",
+  "SALU utilization": lambda s: f"{100 * (s['SQ_INSTS_SALU'][0] / s['SQ_INSTS_SALU'][2]) / (s['GRBM_GUI_ACTIVE'][1] * 4):.1f}%",
+}
 
 def unpack_pmc(e) -> dict:
   agg_cols = ["Name", "Sum"]
   sample_cols = ["XCC", "INST", "SE", "SA", "WGP", "Value"]
   rows:list[list] = []
+  stats:dict[str, tuple[int, int, int]] = {}  # name -> (sum, max, count)
   view, ptr = memoryview(e.blob).cast('Q'), 0
   for s in e.sched:
     row:list = [s.name, 0, {"cols":sample_cols, "rows":[]}]
+    max_val, cnt = 0, 0
     for sample in itertools.product(range(s.xcc), range(s.inst), range(s.se), range(s.sa), range(s.wgp)):
       row[1] += (val:=int(view[ptr]))
+      max_val, cnt = max(max_val, val), cnt + 1
       row[2]["rows"].append(sample+(val,))
       ptr += 1
+    stats[s.name] = (row[1], max_val, cnt)
     rows.append(row)
+  for name, fn in metrics.items():
+    try: rows.append([name, fn(stats)])
+    except KeyError: pass
   return {"rows":rows, "cols":agg_cols}
 
 # ** on startup, list all the performance counter traces
 
-def load_counters(profile:list[ProfileEvent]) -> None:
+def load_amd_counters(ctxs:list[dict], profile:list[ProfileEvent]) -> None:
   from tinygrad.runtime.ops_amd import ProfileSQTTEvent, ProfilePMCEvent
-  counter_events:dict[tuple[str, int], dict] = {}
+  counter_events:dict[tuple[int, int], dict] = {}
   durations:dict[str, list[float]] = {}
-  prg_events:dict[str, ProfileProgramEvent] = {}
-  dev_events:dict[str, ProfileDeviceEvent] = {}
+  prg_events:dict[int, ProfileProgramEvent] = {}
+  arch = ""
   for e in profile:
     if isinstance(e, (ProfilePMCEvent, ProfileSQTTEvent)): counter_events.setdefault((e.kern, e.exec_tag), {}).setdefault(type(e), []).append(e)
     if isinstance(e, ProfileRangeEvent) and e.device.startswith("AMD") and e.en is not None:
       durations.setdefault(str(e.name), []).append(float(e.en-e.st))
-    if isinstance(e, ProfileProgramEvent): prg_events[str(e.name)] = e
-    if isinstance(e, ProfileDeviceEvent): dev_events[e.device] = e
-  ctxs.append({"name":"All Counters", "steps":[create_step("PMC", ("/all-pmc", len(ctxs), 0), \
-      (durations, {k:v[ProfilePMCEvent][0] for k,v in counter_events.items()}))]})
+    if isinstance(e, ProfileProgramEvent) and e.tag is not None: prg_events[e.tag] = e
+    if isinstance(e, ProfileDeviceEvent) and e.device.startswith("AMD"): arch = f"gfx{unwrap(e.props)['gfx_target_version']//1000}"
+  if len(counter_events) == 0: return None
+  ctxs.append({"name":"All Counters", "steps":[create_step("PMC", ("/all-pmc", len(ctxs), 0), (durations, all_counters:={}))]})
   run_number = {n:0 for n,_ in counter_events}
-  for k,v in counter_events.items():
-    prg = trace.keys[r].ret if (r:=ref_map.get(k[0])) else None
-    name = prg.name if prg is not None else k[0]
-    run_number[k[0]] += 1
+  for (k, tag),v in counter_events.items():
+    # use the colored name if it exists
+    name = unwrap(get_prg_uop(r)).src[0].arg.name if (r:=ref_map.get(pname:=prg_events[k].name)) is not None else pname
+    run_number[k] += 1
     steps:list[dict] = []
-    if (pmc:=v.get(ProfilePMCEvent)): steps.append(create_step("PMC", ("/prg-pmc", len(ctxs), len(steps)), pmc))
+    if (pmc:=v.get(ProfilePMCEvent)):
+      steps.append(create_step("PMC", ("/prg-pmc", len(ctxs), len(steps)), pmc))
+      all_counters[(name, run_number[k], pname)] = pmc[0]
+    # to decode a SQTT trace, we need the raw stream, program binary and device properties
     if (sqtt:=v.get(ProfileSQTTEvent)):
-      # to decode a SQTT trace, we need the raw stream, program binary and device properties
-      steps.append(create_step("SQTT", ("/prg-sqtt", len(ctxs), len(steps)), (k, [*sqtt, prg_events[k[0]], dev_events[sqtt[0].device]])))
-      if getenv("SQTT_PARSE"):
-        # run our decoder on startup, we don't use this since it only works on gfx11
-        from extra.sqtt.attempt_sqtt_parse import parse_sqtt_print_packets
-        for e in sqtt: parse_sqtt_print_packets(e.blob)
-    ctxs.append({"name":f"Exec {name} n{run_number[k[0]]}", "steps":steps})
+      for e in sqtt:
+        if e.itrace: steps.append(create_step(f"PKTS SE:{e.se}", (f"/prg-pkts-{e.se}", len(ctxs), len(steps)), data=(e.blob, prg_events[k].lib,arch)))
+      steps.append(create_step("SQTT", ("/prg-sqtt", len(ctxs), len(steps)), ((k, tag), sqtt, prg_events[k], arch)))
+    ctxs.append({"name":f"Exec {name}"+(f" n{run_number[k]}" if run_number[k] > 1 else ""), "steps":steps})
+
+def sqtt_timeline(data:bytes, lib:bytes, target:str) -> list[ProfileEvent]:
+  from tinygrad.renderer.amd.sqtt import map_insts, InstructionInfo, PacketType, INST, InstOp, VALUINST, IMMEDIATE, IMMEDIATE_MASK, VMEMEXEC, ALUEXEC
+  from tinygrad.renderer.amd.sqtt import INST_RDNA4, InstOpRDNA4
+  ret:list[ProfileEvent] = []
+  rows:dict[str, None] = {}
+  trace:dict[str, set[int]] = {}
+  def add(name:str, p:PacketType, idx=0, width=1, op_name=None, wave=None, info:InstructionInfo|None=None) -> None:
+    if hasattr(p, "wave"): wave = p.wave
+    rows.setdefault(r:=(f"WAVE:{wave}" if wave is not None else f"{p.__class__.__name__}:0 {name}"))
+    key = TracingKey(f"{op_name if op_name is not None else name} OP:{idx}", ret=str(info.inst) if info is not None else None)
+    ret.append(ProfileRangeEvent(r, key, Decimal(p._time), Decimal(p._time+width)))
+  for p, info in map_insts(data, lib, target):
+    if len(ret) > getenv("MAX_SQTT_PKTS", 50_000): break
+    if isinstance(p, (INST, INST_RDNA4)):
+      op_name = p.op.name if isinstance(p.op, (InstOp, InstOpRDNA4)) else f"0x{p.op:02x}"
+      name, width = (op_name, 10 if "BARRIER" in op_name else 1)
+      add(name, p, width=width, idx=int("OTHER" in name), info=info)
+    if isinstance(p, (VALUINST, IMMEDIATE)): add(p.__class__.__name__, p, info=info)
+    if isinstance(p, IMMEDIATE_MASK): add("IMMEDIATE", p, wave=unwrap(info).wave, info=info)
+    if isinstance(p, (VMEMEXEC, ALUEXEC)):
+      name = str(p.src).split('.')[1]
+      if name == "VALU_SALU":
+        add("VALU", p)
+        add("SALU", p)
+      else:
+        add(name.replace("_ALT", ""), p, op_name=name)
+      if p._time in trace.setdefault(name, set()): raise AssertionError(f"packets overlap in shared resource! {name}")
+      trace[name].add(p._time)
+  return [ProfilePointEvent(r, "start", r, ts=Decimal(0)) for r in rows]+ret
 
 # ** SQTT OCC only unpacks wave start, end time and SIMD location
 
-def unpack_sqtt(key:tuple[str, int], profile:list[ProfileEvent]) -> tuple[dict[str, list[ProfileEvent]], list[str], dict[str, dict[str, dict]]]:
+def unpack_sqtt(key:tuple[str, int], data:list, p:ProfileProgramEvent,
+                target:str) -> tuple[dict[str, list[ProfileEvent]], list[str], dict[str, dict[str, dict]]]:
   # * init decoder
   from extra.sqtt.roc import decode
-  rctx = decode(profile)
-  disasm = rctx.disasms[key[0]]
+  base = unwrap(p.base)
+  addr_table = amd_decode(unwrap(p.lib), target)
+  disasm:dict[int, Inst] = {addr+base:inst for addr, inst in addr_table.items()}
+  rctx = decode(data, {p.tag:disasm})
   cu_events:dict[str, list[ProfileEvent]] = {}
   # * INST waves
   wave_insts:dict[str, dict[str, dict]] = {}
@@ -281,8 +381,8 @@ def unpack_sqtt(key:tuple[str, int], profile:list[ProfileEvent]) -> tuple[dict[s
     if (u:=w.wave_loc) not in inst_units: inst_units[u] = itertools.count(0)
     n = next(inst_units[u])
     if (events:=cu_events.get(w.cu_loc)) is None: cu_events[w.cu_loc] = events = []
-    events.append(ProfileRangeEvent(w.simd_loc, loc:=f"INST WAVE:{w.wave_id} N:{n}", Decimal(w.begin_time), Decimal(w.end_time)))
-    wave_insts.setdefault(w.cu_loc, {})[f"{u} N:{n}"] = {"wave":w, "disasm":disasm, "run_number":n, "loc":loc}
+    events.append(ProfileRangeEvent(f"SIMD:{w.simd}", loc:=f"INST WAVE:{w.wave_id} N:{n}", Decimal(w.begin_time), Decimal(w.end_time)))
+    wave_insts.setdefault(w.cu_loc, {})[f"{u} N:{n}"] = {"wave":w, "disasm":disasm, "prg":p, "run_number":n, "loc":loc}
   # * OCC waves
   units:dict[str, itertools.count] = {}
   wave_start:dict[str, int] = {}
@@ -292,24 +392,26 @@ def unpack_sqtt(key:tuple[str, int], profile:list[ProfileEvent]) -> tuple[dict[s
     if occ.start: wave_start[u] = occ.time
     else:
       if (events:=cu_events.get(occ.cu_loc)) is None: cu_events[occ.cu_loc] = events = []
-      events.append(ProfileRangeEvent(occ.simd_loc, f"OCC WAVE:{occ.wave_id} N:{next(units[u])}", Decimal(wave_start.pop(u)), Decimal(occ.time)))
+      events.append(ProfileRangeEvent(f"SIMD:{occ.simd}", f"OCC WAVE:{occ.wave_id} N:{next(units[u])}", Decimal(wave_start.pop(u)),Decimal(occ.time)))
   return cu_events, list(units), wave_insts
 
-def device_sort_fn(k:str) -> tuple[int, str, int]:
-  order = {"GC": 0, "USER": 1, "TINY": 2, "DISK": 999}
-  dname = k.split()[0]
-  dev_rank = next((v for k,v in order.items() if dname.startswith(k)), len(order))
-  return (dev_rank, dname, len(k))
+def device_sort_fn(k:str) -> tuple:
+  special = {"GC": 0, "USER": 1, "TINY": 2, "ALLDEVS":100, "DISK": 999}
+  is_memory = k.endswith(" Memory")
+  p = k.split(" ")[0].split(":")
+  dev_base = p[0] if len(p) < 2 or not p[1].isdigit() else f"{p[0]}:{p[1]}"
+  return (is_memory, special.get(p[0], special['ALLDEVS']), dev_base, k)
 
 def get_profile(profile:list[ProfileEvent], sort_fn:Callable[[str], Any]=device_sort_fn) -> bytes|None:
   # start by getting the time diffs
-  device_decoders:dict[str, Callable[[list[ProfileEvent]], None]] = {}
+  device_decoders:dict[str, Callable[[list[dict], list[ProfileEvent]], None]] = {}
   for ev in profile:
     if isinstance(ev, ProfileDeviceEvent):
-      device_ts_diffs[ev.device] = (ev.comp_tdiff,ev.copy_tdiff if ev.copy_tdiff is not None else ev.comp_tdiff)
-      if (d:=ev.device.split(":")[0]) == "AMD": device_decoders[d] = load_counters
+      device_ts_diffs[ev.device] = ev.tdiff
+      if (d:=ev.device.split(":")[0]) == "AMD": device_decoders[d] = load_amd_counters
+      if d == "NV": device_decoders[d] = load_nv_counters
   # load device specific counters
-  for fxn in device_decoders.values(): fxn(profile)
+  for fxn in device_decoders.values(): fxn(ctxs, profile)
   # map events per device
   dev_events:dict[str, list[tuple[int, int, float, DevEvent]]] = {}
   markers:list[ProfilePointEvent] = []
@@ -332,30 +434,39 @@ def get_profile(profile:list[ProfileEvent], sort_fn:Callable[[str], Any]=device_
     layout[f"{k} Memory"] = mem_layout(v, start_ts, unwrap(end_ts), peaks, dtype_size, scache)
   sorted_layout = sorted([k for k,v in layout.items() if v is not None], key=sort_fn)
   ret = [b"".join([struct.pack("<B", len(k)), k.encode(), unwrap(layout[k])]) for k in sorted_layout]
-  index = json.dumps({"strings":list(scache), "dtypeSize":dtype_size, "markers":[{"ts":int(e.ts-start_ts), **e.arg} for e in markers]}).encode()
-  return struct.pack("<IQII", unwrap(end_ts)-start_ts, max(peaks,default=0), len(index), len(ret))+index+b"".join(ret)
+  index = json.dumps({"strings":list(scache), "dtypeSize":dtype_size, "markers":[{"ts":rel_ts(e.ts, start_ts), **e.arg} for e in markers]}).encode()
+  return struct.pack("<IQII", rel_ts(unwrap(end_ts), start_ts), max(peaks,default=0), len(index), len(ret))+index+b"".join(ret)
+
+# ** PMA counters
+
+def load_nv_counters(ctxs:list[dict], profile:list) -> None:
+  steps:list[dict] = []
+  sm_version = {e.device:e.props.get("sm_version", 0x800) for e in profile if isinstance(e, ProfileDeviceEvent) and e.props is not None}
+  run_number:dict[str, int] = {}
+  for e in profile:
+    if type(e).__name__ == "ProfilePMAEvent":
+      run_number[e.kern] = run_num = run_number.get(e.kern, 0)+1
+      steps.append(create_step(f"PMA {e.kern}"+(f"n{run_num}" if run_num>1 else ""), ("/prg-pma-pkts", len(ctxs), len(steps)),
+                               data=(e.blob, sm_version[e.device])))
+  if steps: ctxs.append({"name":"All Counters", "steps":steps})
+
+def pma_timeline(blob:bytes, sm_version:int) -> list[ProfileEvent]:
+  from extra.nv_pma.decode import decode, decode_tpc_id
+  ret:list[ProfileEvent] = []
+  rows:dict[str, None] = {}
+  tpc_count:dict[int, int] = {}
+  # assume every sample is 32 cycles
+  cycles_per_sample = 32
+  for s, tpc_id in decode(blob, sm_version):
+    if len(ret) > getenv("MAX_SQTT_PKTS", 50_000): break
+    gpc, tpc, sm = decode_tpc_id(tpc_id)
+    tpc_count[tpc_id] = (n:=tpc_count.get(tpc_id,0)) + 1
+    rows.setdefault(row:=f"GPC:{gpc} TPC:{tpc} SM:{sm} WAVE:{s.wave_id}")
+    ret.append(ProfileRangeEvent(row, TracingKey(s.stall_reason.name, ret=f"pc=0x{s.pc_offset:06x} active={s.active}"),
+                                 Decimal(n*cycles_per_sample), Decimal((n+1)*cycles_per_sample)))
+  return [ProfilePointEvent(r, "start", r, ts=Decimal(0)) for r in rows]+ret
 
 # ** Assembly static analyzers
-
-def get_llvm_mca(asm:str, mtriple:str, mcpu:str) -> dict:
-  target_args = f"-mtriple={mtriple} -mcpu={mcpu}"
-  # disassembly output can include headers / metadata, skip if llvm-mca can't parse those lines
-  data = json.loads(system("llvm-mca -skip-unsupported-instructions=parse-failure --json -"+target_args, input=asm.encode()))
-  cr = data["CodeRegions"][0]
-  resource_labels = [repr(x)[1:-1] for x in data["TargetInfo"]["Resources"]]
-  rows:list = [[instr] for instr in cr["Instructions"]]
-  # add scheduler estimates
-  for info in cr["InstructionInfoView"]["InstructionList"]: rows[info["Instruction"]].append(info["Latency"])
-  # map per instruction resource usage
-  instr_usage:dict[int, dict[int, int]] = {}
-  for d in cr["ResourcePressureView"]["ResourcePressureInfo"]:
-    instr_usage.setdefault(i:=d["InstructionIndex"], {}).setdefault(r:=d["ResourceIndex"], 0)
-    instr_usage[i][r] += d["ResourceUsage"]
-  # last row is the usage summary
-  summary = [{"idx":k, "label":resource_labels[k], "value":v} for k,v in instr_usage.pop(len(rows), {}).items()]
-  max_usage = max([sum(v.values()) for i,v in instr_usage.items() if i<len(rows)], default=0)
-  for i,usage in instr_usage.items(): rows[i].append([[k, v, (v/max_usage)*100] for k,v in usage.items()])
-  return {"rows":rows, "cols":["Instruction", "Latency", {"title":"HW Resources", "labels":resource_labels}], "metadata":[summary]}
 
 def get_stdout(f: Callable) -> str:
   buf = io.StringIO()
@@ -364,47 +475,118 @@ def get_stdout(f: Callable) -> str:
   except Exception: traceback.print_exc(file=buf)
   return buf.getvalue()
 
-def amd_readelf(lib:bytes) -> list[dict]:
+def get_elf_section(lib:bytes, name:str):
   from tinygrad.runtime.support.elf import elf_loader
-  import msgpack
-  _, sections, __ = elf_loader(lib)
-  data = next((s for s in sections if s.name.startswith(".note"))).content
-  namesz, descsz, typ = struct.unpack_from(hdr:="<III", data, 0)
-  offset = (struct.calcsize(hdr)+namesz+3) & -4
-  notes = msgpack.unpackb(data[offset:offset+descsz])
-  keys = {".sgpr_count":"SGPRs", ".vgpr_count":"VGPRs", ".max_flat_workgroup_size":"Max WGP size",
-          ".group_segment_fixed_size":"LDS size", ".private_segment_fixed_size":"Scratch size"}
-  return [{"label":label, "value":v} for k,label in keys.items() if (v:=notes["amdhsa.kernels"][0][k]) > 0]
+  return next((sh for sh in elf_loader(lib)[1] if sh.name == name))
+
+def amd_decode(lib:bytes, target:str) -> dict[int, Inst]:
+  text = get_elf_section(lib, ".text")
+  off, buf = text.header.sh_addr, text.content
+  arch = "rdna3" if target.startswith("gfx11") else "rdna4" if target.startswith("gfx12") else "cdna"
+  addr_table:dict[int, Inst] = {}
+  offset = 0
+  while offset < len(buf):
+    remaining = buf[offset:]
+    fmt = detect_format(remaining, arch)
+    decoded = fmt.from_bytes(remaining)
+    addr_table[off+offset] = decoded
+    offset += decoded.size()
+  return addr_table
+
+def parse_branch(inst) -> int|None:
+  if "branch" in getattr(inst, "op_name", "").lower():
+    x = inst.simm16 & 0xffff
+    return (x - 0x10000 if x & 0x8000 else x)*4
+  return None
+
+COND_TAKEN, COND_NOT_TAKEN, UNCOND = range(3)
+def amdgpu_cfg(lib:bytes, target:str) -> dict:
+  # decode
+  pc_table = amd_decode(lib, target)
+  # get leaders
+  leaders:set[int] = {next(iter(pc_table))}
+  for pc, inst in pc_table.items():
+    if (offset:=parse_branch(inst)) is not None: leaders.update((pc+inst.size()+offset, pc+inst.size()))
+  # build the cfg
+  curr:int|None = None
+  blocks:dict[int, list[int]] = {}
+  paths:dict[int, dict[int, int]] = {}
+  lines:list[str] = []
+  disasm = {pc:str(inst) for pc,inst in pc_table.items()}
+  asm_width = max(len(asm) for asm in disasm.values())
+  for pc, inst in pc_table.items():
+    lines.append(f"  {disasm[pc]:<{asm_width}}  // {pc:012X}")
+    if pc in leaders:
+      paths[curr:=pc] = {}
+      blocks[pc] = []
+    else: assert curr is not None, f"no basic block found for {pc}"
+    blocks[curr].append(pc)
+    # otherwise a basic block can have exactly one or two paths
+    nx = pc+inst.size()
+    if (offset:=parse_branch(inst)) is not None:
+      if inst.op_name == "S_BRANCH": paths[curr][nx+offset] = UNCOND
+      else: paths[curr].update([(nx+offset, COND_TAKEN), (nx, COND_NOT_TAKEN)])
+    elif nx in leaders: paths[curr][nx] = UNCOND
+  pc_tokens:dict[int, list[dict]] = {}
+  from tinygrad.renderer.amd.dsl import Reg
+  for pc, inst in pc_table.items():
+    pc_tokens[pc] = tokens = []
+    for name, field in inst._fields:
+      if isinstance(val:=getattr(inst, name), Reg): tokens.append({"st":val.fmt(), "keys":[f"r{val.offset+i}" for i in range(val.sz)], "kind":1})
+      elif name in {"op","opx","opy"}: tokens.append({"st":(op_name:=val.name.lower()), "keys":[op_name], "kind":0})
+      elif name != "encoding" and val != field.default: tokens.append({"st":(s:=repr(val)), "keys":[s], "kind":1})
+  # show a smaller view for repeated instructions in the graph
+  for pcs in blocks.values():
+    new_pcs:list[int] = []
+    i, n = 0, len(pcs)
+    while i < n:
+      j = i+1
+      while j<n and pc_table[pcs[j]] == pc_table[pcs[i]]: j += 1
+      new_pcs.append(pcs[i])
+      if j-i>1:
+        pc_tokens[pcs[i]].append({"st":f"({j-i}x)", "keys":[], "kind":0})
+        for k in range(i+1, j): del pc_tokens[pcs[k]]
+      i = j
+    pcs[:] = new_pcs
+  from tinygrad.runtime.autogen import amdgpu_kd
+  kd = amdgpu_kd.llvm_amdhsa_kernel_descriptor_t.from_buffer_copy(bytearray(get_elf_section(lib, ".rodata").content))
+  vgpr_gran = kd.compute_pgm_rsrc1 & amdgpu_kd.COMPUTE_PGM_RSRC1_GRANULATED_WORKITEM_VGPR_COUNT
+  return {"data":{"blocks":blocks, "paths":paths, "pc_tokens":pc_tokens}, "src":"\n".join(lines),
+          "metadata":[[{"label":f"{r} Alloc", "value":v} for r,v in [("VGPR", (vgpr_gran+1)*8-7), ("LDS", kd.group_segment_fixed_size),
+                                                                     ("Scratch", kd.private_segment_fixed_size)] if v>0]]}
 
 # ** Main render function to get the complete details about a trace event
 
-def get_render(i:int, j:int, fmt:str) -> dict:
+def get_render(query:str) -> dict:
+  url = urlparse(query)
+  i, j, fmt = get_int(qs:=parse_qs(url.query), "ctx"), get_int(qs, "step"), url.path.lstrip("/")
   data = ctxs[i]["steps"][j]["data"]
   if fmt == "graph-rewrites": return {"value":get_full_rewrite(trace.rewrites[i][j]), "content_type":"text/event-stream"}
-  if fmt == "uops": return {"src":get_stdout(lambda: print_uops(data.uops or [])), "lang":"txt"}
-  if fmt == "code": return {"src":data.src, "lang":"cpp"}
+  if fmt == "uops": return {"src":get_stdout(lambda: print_uops(data)), "lang":"txt"}
+  if fmt == "code": return {"src":data, "lang":"cpp"}
   if fmt == "asm":
-    compiler = Device[data.device].compiler
-    disasm_str = get_stdout(lambda: compiler.disassemble(compiler.compile(data.src)))
-    from tinygrad.runtime.support.compiler_cpu import llvm, LLVMCompiler
-    if isinstance(compiler, LLVMCompiler):
-      return get_llvm_mca(disasm_str, ctypes.string_at(llvm.LLVMGetTargetMachineTriple(tm:=compiler.target_machine)).decode(),
-                          ctypes.string_at(llvm.LLVMGetTargetMachineCPU(tm)).decode())
-    metadata:list = []
-    if data.device.startswith("AMD"):
-      with soft_err(lambda err: metadata.append(err)):
-        metadata.append(amd_readelf(compiler.compile(data.src)))
-    return {"src":disasm_str, "lang":"amdgpu" if data.device.startswith("AMD") else None, "metadata":metadata}
+    ret:dict = {}
+    renderer, lib = data
+    if renderer.device.startswith("AMD"):
+      with soft_err(lambda err: ret.update(err)): ret.update(amdgpu_cfg(lib, renderer.arch))
+    else: ret["src"] = get_stdout(lambda: renderer.compiler.disassemble(lib))
+    return ret
   if fmt == "all-pmc":
     durations, pmc = data
-    ret:dict = {"cols":{}, "rows":[]}
-    for (prg,_),events in pmc.items():
+    ret = {"cols":{}, "rows":[]}
+    for (name, n, k),events in pmc.items():
       pmc_table = unpack_pmc(events)
       ret["cols"].update([(r[0], None) for r in pmc_table["rows"]])
-      ret["rows"].append((prg, durations[prg].pop(0), *[r[1] for r in pmc_table["rows"]]))
+      ret["rows"].append((name, durations[k][n-1], *[r[1] for r in pmc_table["rows"]]))
     ret["cols"] = ["Kernel", "Duration", *ret["cols"]]
     return ret
   if fmt == "prg-pmc": return unpack_pmc(data[0])
+  if fmt.startswith("prg-pkts"):
+    ret = {}
+    with soft_err(lambda err:ret.update(err)):
+      if (events:=get_profile(sqtt_timeline(*data), sort_fn=row_tuple)): ret = {"value":events, "content_type":"application/octet-stream"}
+      else: ret = {"src":"No SQTT trace on this SE."}
+    return ret
   if fmt == "prg-sqtt":
     ret = {}
     if len((steps:=ctxs[i]["steps"])[j+1:]) == 0:
@@ -431,11 +613,11 @@ def get_render(i:int, j:int, fmt:str) -> dict:
     pc_to_inst = data["disasm"]
     start_pc = None
     rows:dict[int, dict] = {}
+    for pc, inst in pc_to_inst.items():
+      if start_pc is None: start_pc = pc
+      rows[pc] = {"pc":pc-start_pc, "inst":str(inst), "hit_count":0, "dur":0, "stall":0, "type":"", "hits":{"cols":inst_columns, "rows":[]}}
     for e in w.unpack_insts():
-      if start_pc is None: start_pc = e.pc
-      if (inst:=rows.get(e.pc)) is None:
-        rows[e.pc] = inst = {"pc":e.pc-start_pc, "inst":pc_to_inst[e.pc][0], "hit_count":0, "dur":0, "stall":0, "type":str(e.typ).split("_")[-1],
-                             "hits":{"cols":inst_columns, "rows":[]}}
+      if not (inst:=rows[e.pc]).get("type"): inst["type"] = str(e.typ).split("_")[-1]
       inst["hit_count"] += 1
       inst["dur"] += e.dur
       inst["stall"] += e.stall
@@ -443,7 +625,13 @@ def get_render(i:int, j:int, fmt:str) -> dict:
       prev_instr = max(prev_instr, e.time + e.dur)
     summary = [{"label":"Total Cycles", "value":w.end_time-w.begin_time}, {"label":"SE", "value":w.se}, {"label":"CU", "value":w.cu},
                {"label":"SIMD", "value":w.simd}, {"label":"Wave ID", "value":w.wave_id}, {"label":"Run number", "value":data["run_number"]}]
-    return {"rows":[tuple(v.values()) for v in rows.values()], "cols":columns, "metadata":[summary]}
+    return {"rows":[tuple(v.values()) for v in rows.values()], "cols":columns, "metadata":[summary], "ref":ref_map.get(data["prg"].name)}
+  if fmt == "prg-pma-pkts":
+    ret = {}
+    with soft_err(lambda err:ret.update(err)):
+      if (events:=get_profile(pma_timeline(*data), sort_fn=row_tuple)): ret = {"value":events, "content_type":"application/octet-stream"}
+      else: ret = {"src":"No PMA samples found."}
+    return ret
   return data
 
 # ** HTTP server
@@ -462,16 +650,17 @@ class Handler(HTTPRequestHandler):
         if url.path.endswith(".js"): content_type = "application/javascript"
         if url.path.endswith(".css"): content_type = "text/css"
       except FileNotFoundError: status_code = 404
-    elif (query:=parse_qs(url.query)):
-      render_src = get_render(get_int(query, "ctx"), get_int(query, "step"), url.path.lstrip("/"))
-      if "content_type" in render_src: ret, content_type = render_src["value"], render_src["content_type"]
-      else: ret, content_type = json.dumps(render_src).encode(), "application/json"
-      if content_type == "text/event-stream": return self.stream_json(render_src["value"])
+
     elif url.path == "/ctxs":
       lst = [{**c, "steps":[{k:v for k, v in s.items() if k != "data"} for s in c["steps"]]} for c in ctxs]
       ret, content_type = json.dumps(lst).encode(), "application/json"
     elif url.path == "/get_profile" and profile_ret: ret, content_type = profile_ret, "application/octet-stream"
-    else: status_code = 404
+    else:
+      if not (render_src:=get_render(self.path)): status_code = 404
+      else:
+        if "content_type" in render_src: ret, content_type = render_src["value"], render_src["content_type"]
+        else: ret, content_type = json.dumps(render_src).encode(), "application/json"
+        if content_type == "text/event-stream": return self.stream_json(render_src["value"])
 
     return self.send_data(ret, content_type, status_code)
 
@@ -500,11 +689,12 @@ if __name__ == "__main__":
     if s.connect_ex(((HOST:="http://127.0.0.1").replace("http://", ""), PORT:=getenv("PORT", 8000))) == 0:
       raise RuntimeError(f"{HOST}:{PORT} is occupied! use PORT= to change.")
   stop_reloader = threading.Event()
-  multiprocessing.current_process().name = "VizProcess"    # disallow opening of devices
+  multiprocessing.current_process().name = "VizProcess"
+  Context(ALLOW_DEVICE_USAGE=0).__enter__()                # disallow opening of devices
   st = time.perf_counter()
   print("*** viz is starting")
 
-  ctxs:list[dict] = get_rewrites(trace:=load_pickle(args.kernels, default=RewriteTrace([], [], {})))
+  ctxs = get_rewrites(trace:=load_pickle(args.kernels, default=RewriteTrace([], [], {})))
   profile_ret = get_profile(load_pickle(args.profile, default=[]))
 
   server = TCPServerWithReuse(('', PORT), Handler)
