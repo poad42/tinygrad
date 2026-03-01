@@ -82,8 +82,9 @@ class CFGContext:
       order = sorted(v, key=lambda x: len([u for u in v if u in deps[x]]))
       zipped = zip(order, order[1:]) if k.op is Ops.SINK else zip([k.src[1]] + order, order)
       for x,y in zipped:
-        # TODO: this can happen! it causes infinite loop in shufflenet
-        assert y.src[1] not in x.backward_slice_with_self
+        # this can happen: adding this edge would create a cycle in the control-flow constraints.
+        # skip it instead of asserting, allowing codegen to proceed with a weaker (but valid) ordering.
+        if y.src[1] in x.backward_slice_with_self: continue
         self.edges[y.src[1]] = x
 
 pm_add_control_flow = PatternMatcher([

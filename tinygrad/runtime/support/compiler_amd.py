@@ -1,4 +1,4 @@
-import ctypes, hashlib, tempfile, subprocess, pathlib
+import ctypes, hashlib, tempfile, subprocess, pathlib, os, re, time
 from tinygrad.helpers import system
 from tinygrad.runtime.autogen import comgr
 try:
@@ -37,6 +37,18 @@ def set_options(action_info, options:bytes):
 
 # AMD_COMGR_SAVE_TEMPS=1 AMD_COMGR_REDIRECT_LOGS=stdout AMD_COMGR_EMIT_VERBOSE_LOGS=1
 def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
+  trace = os.getenv("TINYGRAD_TRACE_COMPILE", "0") not in ("", "0")
+  trace_filter = os.getenv("TINYGRAD_TRACE_COMPILE_FILTER", "")
+  trace_ms = float(os.getenv("TINYGRAD_TRACE_COMPILE_MS", "0") or 0.0)
+  if trace and trace_filter and trace_filter not in prg:
+    trace = False
+
+  kname = None
+  if trace:
+    m = re.search(r"__global__\s+void\s+(\w+)", prg)
+    if m is not None:
+      kname = m.group(1)
+
   check(comgr.amd_comgr_create_action_info(ctypes.byref(action_info := comgr.amd_comgr_action_info_t())))
   check(comgr.amd_comgr_action_info_set_language(action_info, comgr.AMD_COMGR_LANGUAGE_HIP))
   check(comgr.amd_comgr_action_info_set_isa_name(action_info, b"amdgcn-amd-amdhsa--" + arch.encode()))
@@ -53,7 +65,9 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
   if asm:
     check(comgr.amd_comgr_set_data_name(data_src, b"<null>.s"))
     check(comgr.amd_comgr_data_set_add(data_set_src, data_src))
+    t_asm = time.perf_counter()
     status = comgr.amd_comgr_do_action(comgr.AMD_COMGR_ACTION_ASSEMBLE_SOURCE_TO_RELOCATABLE, action_info, data_set_src, data_set_reloc)
+    t_asm = time.perf_counter() - t_asm
     if status != 0:
       print(_get_comgr_data(data_set_reloc, comgr.AMD_COMGR_DATA_KIND_LOG).decode())
       raise RuntimeError("assemble failed")
@@ -66,16 +80,46 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
       "-D__HIPCC_RTC__", "-std=c++14", "-nogpuinc", "-Wno-gnu-line-marker", "-Wno-missing-prototypes", f"--offload-arch={arch}",
       "-I/opt/rocm/include", "-Xclang -disable-llvm-passes", "-Xclang -aux-triple", "-Xclang x86_64-unknown-linux-gnu"]
     check(set_options(action_info, ' '.join(options).encode()))
+    t_compile = time.perf_counter()
     status = comgr.amd_comgr_do_action(comgr.AMD_COMGR_ACTION_COMPILE_SOURCE_WITH_DEVICE_LIBS_TO_BC, action_info, data_set_src, data_set_bc)
+    t_compile = time.perf_counter() - t_compile
     if status != 0:
+      if os.getenv("TINYGRAD_DUMP_COMPILE_FAIL", "0") not in ("", "0"):
+        dump_dir = os.getenv("TINYGRAD_DUMP_COMPILE_FAIL_DIR", "") or tempfile.gettempdir()
+        try:
+          pathlib.Path(dump_dir).mkdir(parents=True, exist_ok=True)
+          h = hashlib.sha256(prg.encode()).hexdigest()[:16]
+          suffix = "s" if asm else "hip"
+          fn = pathlib.Path(dump_dir) / f"tinygrad_comgr_fail_{arch}_{h}.{suffix}"
+          fn.write_text(prg)
+          print(f"[COMPILE_FAIL_DUMP] wrote {fn}", flush=True)
+        except Exception as ex:
+          print(f"[COMPILE_FAIL_DUMP] failed to write source: {ex}", flush=True)
       print(_get_comgr_data(data_set_bc, comgr.AMD_COMGR_DATA_KIND_LOG).decode())
       raise RuntimeError("compile failed")
     check(set_options(action_info, b"-O3 -mllvm -amdgpu-internalize-symbols"))
+    t_codegen = time.perf_counter()
     check(comgr.amd_comgr_do_action(comgr.AMD_COMGR_ACTION_CODEGEN_BC_TO_RELOCATABLE, action_info, data_set_bc, data_set_reloc))
+    t_codegen = time.perf_counter() - t_codegen
 
   check(set_options(action_info, b""))
+  t_link = time.perf_counter()
   check(comgr.amd_comgr_do_action(comgr.AMD_COMGR_ACTION_LINK_RELOCATABLE_TO_EXECUTABLE, action_info, data_set_reloc, data_set_exec))
+  t_link = time.perf_counter() - t_link
   ret = _get_comgr_data(data_set_exec, comgr.AMD_COMGR_DATA_KIND_EXECUTABLE)
+
+  if trace:
+    compile_s = locals().get('t_compile', 0.0)
+    codegen_s = locals().get('t_codegen', 0.0)
+    asm_s = locals().get('t_asm', 0.0)
+    total_ms = (compile_s + codegen_s + asm_s + t_link) * 1000.0
+    if trace_ms <= 0.0 or total_ms >= trace_ms:
+      extra = f" kernel={kname}" if kname is not None else ""
+      if asm:
+        print(f"[TRACE_COMPILE] arch={arch}{extra} assemble={asm_s*1000.0:.2f}ms link={t_link*1000.0:.2f}ms total={total_ms:.2f}ms", flush=True)
+      else:
+        print(f"[TRACE_COMPILE] arch={arch}{extra} compile={compile_s*1000.0:.2f}ms codegen={codegen_s*1000.0:.2f}ms link={t_link*1000.0:.2f}ms total={total_ms:.2f}ms", flush=True)
+
   check(comgr.amd_comgr_release_data(data_src))
   for x in [data_set_src, data_set_bc, data_set_reloc, data_set_exec]: check(comgr.amd_comgr_destroy_data_set(x))
   check(comgr.amd_comgr_destroy_action_info(action_info))

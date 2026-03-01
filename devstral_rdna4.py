@@ -314,6 +314,7 @@ class Attention:
         self.layer_idx = None
 
     def __call__(self, x, start_pos, freqs_cis, mask, rope_scale):
+        trace = os.getenv("DEVSTRAL_TRACE", "0") not in ("", "0")
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         if self.dump_qkv and self.dump_qkv_path is not None and self.dump_qkv_layer == self.layer_idx and isinstance(start_pos, int) and start_pos == 0:
             np.savez(self.dump_qkv_path, q=xq.float().numpy(), k=xk.float().numpy(), v=xv.float().numpy())
@@ -365,7 +366,17 @@ class Attention:
             values = values.reshape(B, self.n_kv_heads, 1, -1, self.head_dim).expand(B, self.n_kv_heads, repeat, -1, self.head_dim)
             keys = keys.reshape(B, self.n_heads, -1, self.head_dim)
             values = values.reshape(B, self.n_heads, -1, self.head_dim)
+        if trace:
+            t0 = time.perf_counter()
+            try:
+                sp = int(start_pos) if isinstance(start_pos, int) else str(start_pos)
+            except Exception:
+                sp = str(start_pos)
+            print(f"[TRACE] layer={self.layer_idx:02d} attn enter start_pos={sp} q_len={L} kv_len={keys.shape[2]} flash={use_flash} causal={is_causal}", flush=True)
         output = xq.scaled_dot_product_attention(keys, values, attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal)
+        if trace:
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            print(f"[TRACE] layer={self.layer_idx:02d} attn exit  dt={dt_ms:.2f}ms", flush=True)
         return self.wo(output.transpose(1, 2).reshape(B, L, -1))
 
 class FeedForward:
@@ -425,6 +436,7 @@ class DevstralModel:
         print(f"Initialized RoPE: theta={config.rope_theta}, mscale={self.mscale:.4f}, rope_scaling={config.rope_scaling is not None}")
 
     def __call__(self, x, start_pos: Union[int, Variable]):
+        trace = os.getenv("DEVSTRAL_TRACE", "0") not in ("", "0")
         h = self.embed_tokens[x]
         
         # Temporary Fix for Scaling Issue
@@ -445,12 +457,22 @@ class DevstralModel:
         freqs = self.freqs_cis[start_pos:start_pos+L]
 
         for li, layer in enumerate(self.layers):
+            if trace:
+                t0 = time.perf_counter()
+                try:
+                    sp = int(start_pos) if isinstance(start_pos, int) else str(start_pos)
+                except Exception:
+                    sp = str(start_pos)
+                print(f"[TRACE] layer={li:02d} enter start_pos={sp} L={L}", flush=True)
             if self.dump_stage is not None and self.dump_layer_idx == li and self.dump_layer_path is not None:
                 h, inter = layer.forward_with_intermediates(h, start_pos, freqs, mask, self.mscale)
                 if self.dump_stage in inter:
                     np.save(self.dump_layer_path, inter[self.dump_stage].float().numpy())
             else:
                 h = layer(h, start_pos, freqs, mask, self.mscale)
+            if trace:
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                print(f"[TRACE] layer={li:02d} exit  dt={dt_ms:.2f}ms", flush=True)
             if do_stats:
                 hn = h.float().numpy()
                 print(f"[DEBUG] Layer {li:02d}: mean={hn.mean():.6f}, std={hn.std():.6f}, min={hn.min():.3f}, max={hn.max():.3f}")
@@ -667,6 +689,7 @@ def main():
     parser.add_argument("--jit", action="store_true", help="Enable TinyJit for decode step (speed profiling)")
     parser.add_argument("--bench", action="store_true", help="Print prefill/decode timing and tokens/sec (suppresses per-token printing)")
     parser.add_argument("--flash-attn", action="store_true", help="Enable tinygrad FLASH_ATTENTION path (if supported by backend)")
+    parser.add_argument("--trace", action="store_true", help="Print coarse trace timing (per-layer + attention) to locate stalls")
     parser.add_argument("--timeout-seconds", type=float, default=0.0, help="Abort the run if it exceeds this many seconds (0 disables)")
     parser.add_argument("--awq", action="store_true", help="Compatibility flag (AWQ is inferred from weight format)")
     parser.add_argument("--layers", type=int, default=None, help="Optional cap on number of layers to load/run")
@@ -693,6 +716,9 @@ def main():
 
     if args.flash_attn:
         os.environ["FLASH_ATTENTION"] = "1"
+
+    if args.trace:
+        os.environ["DEVSTRAL_TRACE"] = "1"
 
     if args.oracle is not None:
         try:
@@ -822,6 +848,8 @@ def main():
         print(f"[WARN] FLASH_ATTENTION compile failed; falling back to naive SDPA ({e})")
         return True
 
+    if os.getenv("DEVSTRAL_TRACE", "0") not in ("", "0"):
+        print(f"[TRACE] prefill begin prompt_tokens={len(tokens)}", flush=True)
     print("\n[Prefill Stage]")
     x = Tensor([tokens], device=model.device)
     t_prefill_st = time.perf_counter()
@@ -837,6 +865,8 @@ def main():
             raise
     _sync()
     t_prefill = time.perf_counter() - t_prefill_st
+    if os.getenv("DEVSTRAL_TRACE", "0") not in ("", "0"):
+        print(f"[TRACE] prefill end   dt={t_prefill*1000.0:.2f}ms", flush=True)
     
     next_logits = logits[0, -1]
     if args.oracle is not None:
