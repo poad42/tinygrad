@@ -315,10 +315,12 @@ class Attention:
 
     def __call__(self, x, start_pos, freqs_cis, mask, rope_scale):
         trace = os.getenv("DEVSTRAL_TRACE", "0") not in ("", "0")
+        raw_use_flash = os.getenv("FLASH_ATTENTION", "0") not in ("", "0")
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         if self.dump_qkv and self.dump_qkv_path is not None and self.dump_qkv_layer == self.layer_idx and isinstance(start_pos, int) and start_pos == 0:
             np.savez(self.dump_qkv_path, q=xq.float().numpy(), k=xk.float().numpy(), v=xv.float().numpy())
         B, L, _ = xq.shape
+        use_flash = raw_use_flash and L > 1
         xq = xq.reshape(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         xk = xk.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
         xv = xv.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
@@ -348,9 +350,15 @@ class Attention:
         is_causal = False
         if mask is None and L == 1:
             cache_len = keys.shape[2]
-            idx = Tensor.arange(cache_len, device=self.device).reshape(1, 1, 1, cache_len)
-            decode_mask = (idx <= (start_pos)).where(0, -float("inf"))
-            attn_mask = decode_mask
+            # For decode with q_len=1, keys/values are already truncated to <= start_pos+1.
+            # FlashAttention decode expects no explicit mask tensor here.
+            if use_flash:
+                attn_mask = None
+                is_causal = False
+            else:
+                idx = Tensor.arange(cache_len, device=self.device).reshape(1, 1, 1, cache_len)
+                decode_mask = (idx <= (start_pos)).where(0, -float("inf"))
+                attn_mask = decode_mask
         elif mask is None and L > 1 and isinstance(start_pos, int) and start_pos == 0 and keys.shape[2] == L:
             attn_mask = None
             is_causal = True
@@ -359,7 +367,6 @@ class Attention:
 
         # Use tinygrad's S-DPA implementation.
         # When FLASH_ATTENTION is enabled, keep KV heads unexpanded so the kernel can handle GQA via GROUP_SIZE.
-        use_flash = os.getenv("FLASH_ATTENTION", "0") not in ("", "0")
         if not use_flash and self.n_heads != self.n_kv_heads:
             repeat = self.n_heads // self.n_kv_heads
             keys = keys.reshape(B, self.n_kv_heads, 1, -1, self.head_dim).expand(B, self.n_kv_heads, repeat, -1, self.head_dim)
@@ -373,7 +380,16 @@ class Attention:
             except Exception:
                 sp = str(start_pos)
             print(f"[TRACE] layer={self.layer_idx:02d} attn enter start_pos={sp} q_len={L} kv_len={keys.shape[2]} flash={use_flash} causal={is_causal}", flush=True)
-        output = xq.scaled_dot_product_attention(keys, values, attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal)
+        if use_flash:
+            output = xq.scaled_dot_product_attention(keys, values, attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal)
+        else:
+            qk = xq.matmul(keys.transpose(-2, -1), dtype=dtypes.float) / math.sqrt(self.head_dim)
+            if is_causal:
+                cm = qk.ones_like(dtype=dtypes.bool).tril()
+                qk = qk + cm.where(0, -float("inf"))
+            if attn_mask is not None:
+                qk = qk + attn_mask
+            output = qk.cast(xq.dtype).softmax(-1) @ values
         if trace:
             dt_ms = (time.perf_counter() - t0) * 1000.0
             print(f"[TRACE] layer={self.layer_idx:02d} attn exit  dt={dt_ms:.2f}ms", flush=True)
@@ -413,13 +429,22 @@ class TransformerBlock:
         }
 
 class DevstralModel:
-    def __init__(self, config, device=None):
+    def __init__(self, config, device=None, layer_devices: Optional[List[str]] = None, embed_device: Optional[str] = None,
+                 norm_device: Optional[str] = None, output_device: Optional[str] = None):
         self.config = config
         self.device = device or Device.DEFAULT
+        self.layer_devices = list(layer_devices) if layer_devices is not None else [self.device for _ in range(config.num_hidden_layers)]
+        if len(self.layer_devices) != config.num_hidden_layers:
+            raise ValueError(f"layer_devices length ({len(self.layer_devices)}) must equal num_hidden_layers ({config.num_hidden_layers})")
+
+        self.embed_device = embed_device or self.layer_devices[0]
+        self.norm_device = norm_device or self.layer_devices[-1]
+        self.output_device = output_device or self.layer_devices[-1]
+
         self.embed_tokens = None
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, device=device)
-        self.output = FP8Linear(config.hidden_size, config.vocab_size, device=device)
-        self.layers = [TransformerBlock(i, config, device=device) for i in range(config.num_hidden_layers)]
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, device=self.norm_device)
+        self.output = FP8Linear(config.hidden_size, config.vocab_size, device=self.output_device)
+        self.layers = [TransformerBlock(i, config, device=self.layer_devices[i]) for i in range(config.num_hidden_layers)]
         self.dump_layer_stats = False
         self.dump_layer_idx = None
         self.dump_layer_path = None
@@ -432,11 +457,13 @@ class DevstralModel:
         rope_len = int(getattr(config, "context_len", config.max_position_embeddings))
         self.freqs_cis, self.mscale = precompute_freqs_cis(
             config.head_dim, rope_len, config.rope_theta, config.rope_scaling)
-        self.freqs_cis = self.freqs_cis.to(device)
+        self.freqs_cis = self.freqs_cis.to(self.layer_devices[0])
         print(f"Initialized RoPE: theta={config.rope_theta}, mscale={self.mscale:.4f}, rope_scaling={config.rope_scaling is not None}")
 
     def __call__(self, x, start_pos: Union[int, Variable]):
         trace = os.getenv("DEVSTRAL_TRACE", "0") not in ("", "0")
+        if x.device != self.embed_device:
+            x = _move_tensor_to_device(x, self.embed_device)
         h = self.embed_tokens[x]
         
         # Temporary Fix for Scaling Issue
@@ -457,6 +484,14 @@ class DevstralModel:
         freqs = self.freqs_cis[start_pos:start_pos+L]
 
         for li, layer in enumerate(self.layers):
+            tgt = self.layer_devices[li]
+            if h.device != tgt:
+                h = _move_tensor_to_device(h, tgt)
+            if freqs.device != tgt:
+                freqs = _move_tensor_to_device(freqs, tgt)
+            if mask is not None and mask.device != tgt:
+                mask = _move_tensor_to_device(mask, tgt)
+
             if trace:
                 t0 = time.perf_counter()
                 try:
@@ -480,8 +515,13 @@ class DevstralModel:
                 np.save(self.dump_layer_path, h.float().numpy())
             if self.stop_layer_idx is not None and li >= self.stop_layer_idx:
                 break
-            
-        return self.output(self.norm(h))
+
+        if h.device != self.norm.weight.device:
+            h = _move_tensor_to_device(h, self.norm.weight.device)
+        h = self.norm(h)
+        if h.device != self.output_device:
+            h = _move_tensor_to_device(h, self.output_device)
+        return self.output(h)
 
 # =============================================================================
 # Loading
@@ -518,7 +558,8 @@ def load_weights(model: DevstralModel, weights_path: str):
         for attr, key_suffix in [("embed_tokens", "embed_tokens.weight"), ("norm", "norm.weight"), ("output", "lm_head.weight")]:
             for p in prefixes:
                 if (p + key_suffix) in state_dict:
-                    w = state_dict[p + key_suffix].to(model.device).realize()
+                    target_device = model.embed_device if attr == "embed_tokens" else (model.norm_device if attr == "norm" else model.output_device)
+                    w = state_dict[p + key_suffix].to(target_device).realize()
                     if attr == "embed_tokens": model.embed_tokens = w
                     elif attr == "norm": model.norm.weight = w
                     else: model.output.weight = w
@@ -530,9 +571,9 @@ def load_weights(model: DevstralModel, weights_path: str):
             for p in prefixes:
                 qweight_key = p + "lm_head.qweight"
                 if qweight_key in state_dict:
-                    model.output.qweight = state_dict[qweight_key].to(model.device).realize()
-                    model.output.qzeros = state_dict[p + "lm_head.qzeros"].to(model.device).realize()
-                    model.output.scales = state_dict[p + "lm_head.scales"].to(model.device).cast(dtypes.float16).realize()
+                    model.output.qweight = state_dict[qweight_key].to(model.output_device).realize()
+                    model.output.qzeros = state_dict[p + "lm_head.qzeros"].to(model.output_device).realize()
+                    model.output.scales = state_dict[p + "lm_head.scales"].to(model.output_device).cast(dtypes.float16).realize()
                     model.output.group_size = model.output.qweight.shape[0] // model.output.qzeros.shape[0]
                     print("  Matched Global: output (AWQ)")
                     break
@@ -547,8 +588,10 @@ def load_weights(model: DevstralModel, weights_path: str):
         
         match_count = 0
         for idx in sorted(found_layers):
+            if model.stop_layer_idx is not None and idx > model.stop_layer_idx: continue
             if idx >= len(model.layers): continue
             layer = model.layers[idx]
+            target_device = model.layer_devices[idx]
             
             # Robust search for each component
             targets = [
@@ -579,27 +622,27 @@ def load_weights(model: DevstralModel, weights_path: str):
                 if found_key:
                     w = state_dict[found_key]
                     if "norm" in script_attr:
-                        obj.weight = w.to(model.device).cast(dtypes.float16).realize()
+                        obj.weight = w.to(target_device).cast(dtypes.float16).realize()
                     else:
                         # FP8 weights can come in as fp8 (preferred) or legacy uint8/int8 storage.
                         if w.dtype in [dtypes.uint8, dtypes.int8]: w = w.bitcast(dtypes.fp8e4m3)
                         if w.dtype == dtypes.fp8e4m3 or w.dtype == dtypes.fp8e5m2:
-                            obj.weight = w.to(model.device).realize()
+                            obj.weight = w.to(target_device).realize()
                         else:
-                            obj.weight = w.to(model.device).cast(dtypes.float16).realize()
+                            obj.weight = w.to(target_device).cast(dtypes.float16).realize()
                     
                     base_key = found_key.replace(".weight", "")
                     
                     # Weight scale (Multiplier)
                     if f"{base_key}.weight_scale" in state_dict:
-                        obj.weight_scale = state_dict[f"{base_key}.weight_scale"].to(model.device).cast(dtypes.float16).realize()
+                        obj.weight_scale = state_dict[f"{base_key}.weight_scale"].to(target_device).cast(dtypes.float16).realize()
                     elif f"{base_key}.weight_scale_inv" in state_dict:
                         # Export uses `weight_scale_inv` as a post-matmul multiplier.
-                        obj.weight_scale = state_dict[f"{base_key}.weight_scale_inv"].to(model.device).cast(dtypes.float16).realize()
+                        obj.weight_scale = state_dict[f"{base_key}.weight_scale_inv"].to(target_device).cast(dtypes.float16).realize()
                     
                     # Activation scale (Divisor)
                     if f"{base_key}.activation_scale" in state_dict:
-                        obj.activation_scale = state_dict[f"{base_key}.activation_scale"].to(model.device).cast(dtypes.float16).realize()
+                        obj.activation_scale = state_dict[f"{base_key}.activation_scale"].to(target_device).cast(dtypes.float16).realize()
 
                     
                     match_count += 1
@@ -615,9 +658,9 @@ def load_weights(model: DevstralModel, weights_path: str):
                         if qweight_key: break
 
                     if qweight_key:
-                        obj.qweight = state_dict[qweight_key].to(model.device).realize()
-                        obj.qzeros = state_dict[qweight_key.replace("qweight", "qzeros")].to(model.device).realize()
-                        obj.scales = state_dict[qweight_key.replace("qweight", "scales")].to(model.device).cast(dtypes.float16).realize()
+                        obj.qweight = state_dict[qweight_key].to(target_device).realize()
+                        obj.qzeros = state_dict[qweight_key.replace("qweight", "qzeros")].to(target_device).realize()
+                        obj.scales = state_dict[qweight_key.replace("qweight", "scales")].to(target_device).cast(dtypes.float16).realize()
                         obj.group_size = obj.qweight.shape[0] // obj.qzeros.shape[0]
                         match_count += 1
         
@@ -643,7 +686,36 @@ def _oracle_write(path: str, obj: Dict):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, separators=(",", ":")) + "\n")
 
+class TokRes:
+    def __init__(self, ids):
+        self.ids = ids
+
+class MistralCommonWrapper:
+    def __init__(self, tok):
+        self.tok = tok
+    
+    def encode(self, text):
+        res = self.tok.instruct_tokenizer.tokenizer.encode(text, bos=False, eos=False)
+        return TokRes(res)
+
+    def decode(self, ids):
+        return self.tok.instruct_tokenizer.tokenizer.decode(ids)
+
 def _load_tokenizer_and_special_ids(weights_path: str):
+    tekken_path = os.path.join(weights_path, "tekken.json")
+    if os.path.exists(tekken_path):
+        try:
+            from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                tok = MistralTokenizer.from_file(tekken_path)
+            wrapper = MistralCommonWrapper(tok)
+            return wrapper, getattr(tok.instruct_tokenizer.tokenizer, 'bos_id', 1), getattr(tok.instruct_tokenizer.tokenizer, 'eos_id', 2)
+        except Exception as e:
+            print("Failed to load tekken.json via mistral_common:", e)
+            # Fall through to tokenizer.json fallback.
+
     tok_path = os.path.join(weights_path, "tokenizer.json")
     if not os.path.exists(tok_path):
         return None, None, None
@@ -675,6 +747,71 @@ def _load_tokenizer_and_special_ids(weights_path: str):
         pass
 
     return tokenizer, bos_id, eos_id
+
+def _discover_available_devices(base: str, max_scan: int = 16) -> List[str]:
+    out: List[str] = []
+    # Probe indexed devices first (AMD:0, AMD:1, ...)
+    for i in range(max_scan):
+        name = f"{base}:{i}"
+        try:
+            Device[name]
+            out.append(name)
+        except Exception:
+            break
+    if len(out) > 0:
+        return out
+    # Fallback to base device name (AMD, CUDA, ...)
+    try:
+        Device[base]
+        return [base]
+    except Exception:
+        return []
+
+def _build_contiguous_layer_map(num_layers: int, devices: List[str]) -> List[str]:
+    if len(devices) == 0:
+        raise ValueError("devices cannot be empty")
+    if len(devices) == 1:
+        return [devices[0] for _ in range(num_layers)]
+    out: List[str] = []
+    for li in range(num_layers):
+        didx = (li * len(devices)) // num_layers
+        if didx >= len(devices):
+            didx = len(devices) - 1
+        out.append(devices[didx])
+    return out
+
+def _move_tensor_to_device(x: Tensor, device: str) -> Tensor:
+    if x.device == device:
+        return x
+    try:
+        return x.to(device).realize()
+    except Exception:
+        # Some AMD setups cannot do direct peer-to-peer device mapping.
+        # Fall back to a host round-trip.
+        return Tensor(x.numpy(), dtype=x.dtype, device=device).realize()
+
+def _is_fp8_export(weights_path: str) -> bool:
+    idx_path = os.path.join(weights_path, "model.safetensors.index.json")
+    if os.path.exists(idx_path):
+        try:
+            with open(idx_path, "r", encoding="utf-8") as f:
+                idx = json.load(f)
+            wmap = idx.get("weight_map", {})
+            if any(("activation_scale" in k) or ("weight_scale_inv" in k) for k in wmap.keys()):
+                return True
+        except Exception:
+            pass
+    # fallback: inspect first shard
+    try:
+        first = sorted(glob.glob(os.path.join(weights_path, "model-*.safetensors")))[0]
+        sd = safe_load(first)
+        if any(("activation_scale" in k) or ("weight_scale_inv" in k) for k in sd.keys()):
+            return True
+        if any(v.dtype in (dtypes.fp8e4m3, dtypes.fp8e5m2) for v in sd.values()):
+            return True
+    except Exception:
+        pass
+    return False
 
 def main():
     parser = argparse.ArgumentParser()
@@ -709,6 +846,9 @@ def main():
     parser.add_argument("--force-decode-from-oracle", type=str, default=None,
                         help="Teacher-force decode: read decode input_id sequence from an oracle JSONL and force decode to follow it")
     parser.add_argument("--fp8-disable", action="store_true", help="Disable FP8 matmul path (float fallback, same weights)")
+    parser.add_argument("--devices", type=str, default=None,
+                        help="Comma-separated device list for layer sharding, e.g. AMD:0,AMD:1,AMD:2,AMD:3")
+    parser.add_argument("--single-gpu", action="store_true", help="Force all layers on one device (disable layer sharding)")
     args = parser.parse_args()
 
     if args.fp8_disable:
@@ -730,14 +870,37 @@ def main():
     else: Device.DEFAULT = "AMD" if "AMD" in Device._devices else "GPU"
     print(f"Running on Backend: {Device.DEFAULT}")
 
+    if args.devices is not None:
+        run_devices = [d.strip() for d in args.devices.split(",") if d.strip()]
+        if len(run_devices) == 0:
+            raise SystemExit("--devices was provided but no valid device names were found")
+        for d in run_devices:
+            try:
+                Device[d]
+            except Exception as e:
+                raise SystemExit(f"Device '{d}' is not available: {e}")
+    elif args.single_gpu:
+        run_devices = [Device.DEFAULT]
+    else:
+        base = Device.DEFAULT.split(":", 1)[0]
+        run_devices = _discover_available_devices(base)
+        if len(run_devices) == 0:
+            run_devices = [Device.DEFAULT]
+    print(f"Model devices: {run_devices}")
+
     config_path = os.path.join(args.weights, "config.json")
     cfg = DevstralConfig(config_path)
     cfg.context_len = min(int(args.context), int(cfg.max_position_embeddings))
     if args.layers is not None:
         cfg.num_hidden_layers = int(args.layers)
+    layer_devices = _build_contiguous_layer_map(cfg.num_hidden_layers, run_devices)
+    layer_device_counts = {d: layer_devices.count(d) for d in run_devices}
+    print(f"Layer sharding: {layer_device_counts}")
     print(f"Config Loaded: {cfg.hidden_size} dim, {cfg.num_hidden_layers} layers, RoPE={cfg.rope_theta}")
+    if not _is_fp8_export(args.weights):
+        print("[WARN] Checkpoint appears to be bf16/full precision (not native fp8 export). Expect much higher VRAM unless sharded.")
     
-    model = DevstralModel(cfg)
+    model = DevstralModel(cfg, layer_devices=layer_devices, embed_device=run_devices[0], norm_device=run_devices[-1], output_device=run_devices[-1])
     model.dump_layer_stats = args.dump_layer_stats
     model.dump_layer_idx = args.dump_layer
     model.dump_layer_path = args.dump_layer_path
@@ -827,10 +990,11 @@ def main():
             signal.signal(signal.SIGALRM, old)
 
     def _sync():
-        try:
-            Device[model.device].synchronize()
-        except Exception:
-            pass
+        for d in sorted(set(model.layer_devices + [model.embed_device, model.norm_device, model.output_device])):
+            try:
+                Device[d].synchronize()
+            except Exception:
+                pass
 
     flash_fell_back = False
     def _maybe_fallback_flash(e: Exception) -> bool:
@@ -851,7 +1015,7 @@ def main():
     if os.getenv("DEVSTRAL_TRACE", "0") not in ("", "0"):
         print(f"[TRACE] prefill begin prompt_tokens={len(tokens)}", flush=True)
     print("\n[Prefill Stage]")
-    x = Tensor([tokens], device=model.device)
+    x = Tensor([tokens], device=model.embed_device)
     t_prefill_st = time.perf_counter()
     try:
         logits = _with_timeout(lambda: model(x, start_pos=0).realize())
@@ -901,6 +1065,10 @@ def main():
         return
 
     decode_step = None
+    use_multi_device = len(set(model.layer_devices + [model.embed_device, model.norm_device, model.output_device])) > 1
+    if args.jit and use_multi_device:
+        print("[WARN] --jit decode is disabled for multi-device runs (cross-device fallback is incompatible with JIT capture).")
+        args.jit = False
     if args.jit:
         pos_var = Variable("pos", 0, cfg.context_len)
         @TinyJit
@@ -911,7 +1079,7 @@ def main():
     print("\n[Decode Stage]")
     t_decode_st = time.perf_counter()
     for i in range(args.max_tokens):
-        x_dec = Tensor([[next_tok]], device=model.device)
+        x_dec = Tensor([[next_tok]], device=model.embed_device)
         try:
             if decode_step is not None:
                 logits = _with_timeout(lambda: decode_step(x_dec, start_pos))
