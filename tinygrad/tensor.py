@@ -2570,11 +2570,10 @@ class Tensor(OpMixin):
     return values._inverse(), indices
 
   @staticmethod
-  def _tri(r:sint, c:sint, diagonal:int=0, device=None, requires_grad:bool|None=None) -> Tensor:
-    assert isinstance(r, int) and isinstance(c, int), f"does not support symbolic, getting {r=}, {c=}"
+  def _tri(r:sint, c:sint, diagonal=0, device=None, requires_grad:bool|None=None) -> Tensor:
     return (Tensor.arange(r, device=device).unsqueeze(-1) + diagonal <= Tensor.arange(c, device=device)).requires_grad_(requires_grad)
 
-  def triu(self, diagonal:int=0) -> Tensor:
+  def triu(self, diagonal:sint=0) -> Tensor:
     """
     Returns the upper triangular part of the tensor, the other elements are set to 0.
 
@@ -2597,7 +2596,7 @@ class Tensor(OpMixin):
     """
     return Tensor._tri(self.shape[-2], self.shape[-1], diagonal=diagonal, device=self.device).where(self, self.zeros_like())
 
-  def tril(self, diagonal:int=0) -> Tensor:
+  def tril(self, diagonal:sint=0) -> Tensor:
     """
     Returns the lower triangular part of the tensor, the other elements are set to 0.
 
@@ -3289,9 +3288,6 @@ class Tensor(OpMixin):
     print(q.scaled_dot_product_attention(k, v).numpy())
     ```
     """
-    # NOTE: it also works when `key` and `value` have symbolic shape.
-    assert all_int(self.shape), f"does not support symbolic shape {self.shape}"
-
     if getenv("FLASH_ATTENTION"):
       from extra.thunder.tiny.fa import flash_attention
       return flash_attention(self, key, value, attn_mask=attn_mask, is_causal=is_causal)
