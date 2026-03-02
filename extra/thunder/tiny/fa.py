@@ -25,7 +25,8 @@ def flash_attention(xq, xk, xv, attn_mask:Tensor|None=None, is_causal:bool=False
   if len(xq.shape) == 3: xq, xk, xv = xq.unsqueeze(0), xk.unsqueeze(0), xv.unsqueeze(0)
 
   odtype = xq.dtype
-  xq, xk, xv = xq.transpose(1, 2).cast(dtypes.bfloat16), xk.transpose(1, 2).cast(dtypes.bfloat16), xv.transpose(1, 2).cast(dtypes.bfloat16)
+  prec_dtype = dtypes.fp8e4m3 if xq.dtype in (dtypes.fp8e4m3, dtypes.fp8e5m2) else dtypes.bfloat16
+  xq, xk, xv = xq.transpose(1, 2).cast(prec_dtype), xk.transpose(1, 2).cast(prec_dtype), xv.transpose(1, 2).cast(prec_dtype)
 
   _, N_, _, D_ = xq.shape
   block_size = max(Q_BLOCK_SIZE, KV_BLOCK_SIZE)
@@ -43,7 +44,7 @@ def flash_attention(xq, xk, xv, attn_mask:Tensor|None=None, is_causal:bool=False
   B_local = B // num_devices
   if DEBUG >= 2: print(f"Flash Attention {B=} {B_local=} {N=} {H=} {D=} {H_KV=} {GROUP_SIZE=}")
 
-  def _custom_forward_impl(ou:UOp, l_vecu:UOp, qu:UOp, ku:UOp, vu:UOp, masku:UOp|None) -> UOp:
+  def _custom_forward_impl(ou:UOp, l_vecu:UOp, qu:UOp, ku:UOp, vu:UOp, masku:UOp|None, prec_dtype) -> UOp:
     with Kernel("fa_custom_forward", (H, N // (Q_BLOCK_SIZE*NUM_WORKERS), B_local), NUM_WORKERS * WARP_THREADS) as ker:
       warp = ker.warp
 
@@ -56,15 +57,15 @@ def flash_attention(xq, xk, xv, attn_mask:Tensor|None=None, is_causal:bool=False
       q_seq = ker.blockIdx_y * NUM_WORKERS + ker.warpid
 
       q_reg_fl = ker.rt((Q_BLOCK_SIZE, D), dtypes.float32)
-      q_reg = ker.rt((Q_BLOCK_SIZE, D), dtypes.bfloat16)
-      q_reg_transposed = ker.rt((D, Q_BLOCK_SIZE), dtypes.bfloat16, TileLayout.COL)
-      k_reg = ker.rt((KV_BLOCK_SIZE, D), dtypes.bfloat16)
-      k_reg_transposed = ker.rt((D, KV_BLOCK_SIZE), dtypes.bfloat16, TileLayout.COL)
-      v_reg = ker.rt((KV_BLOCK_SIZE, D), dtypes.bfloat16, TileLayout.COL)
+      q_reg = ker.rt((Q_BLOCK_SIZE, D), prec_dtype)
+      q_reg_transposed = ker.rt((D, Q_BLOCK_SIZE), prec_dtype, TileLayout.COL)
+      k_reg = ker.rt((KV_BLOCK_SIZE, D), prec_dtype)
+      k_reg_transposed = ker.rt((D, KV_BLOCK_SIZE), prec_dtype, TileLayout.COL)
+      v_reg = ker.rt((KV_BLOCK_SIZE, D), prec_dtype, TileLayout.COL)
       o_reg = ker.rt((D, Q_BLOCK_SIZE), dtypes.float32, TileLayout.COL)
       o_reg_transposed = ker.rt((Q_BLOCK_SIZE, D), dtypes.float32)
       att_block = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), dtypes.float32, TileLayout.COL)
-      att_block_mma = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), dtypes.bfloat16, TileLayout.COL)
+      att_block_mma = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), prec_dtype, TileLayout.COL)
       mask_reg = ker.rt((Q_BLOCK_SIZE, KV_BLOCK_SIZE), dtypes.float32)
       mask_reg_transposed = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), dtypes.float32, TileLayout.COL)
 
@@ -145,10 +146,10 @@ def flash_attention(xq, xk, xv, attn_mask:Tensor|None=None, is_causal:bool=False
       return ker.finish()
 
   def custom_forward_causal(ou:UOp, l_vecu:UOp, qu:UOp, ku:UOp, vu:UOp) -> UOp:
-    return _custom_forward_impl(ou, l_vecu, qu, ku, vu, None)
+    return _custom_forward_impl(ou, l_vecu, qu, ku, vu, None, prec_dtype)
 
   def custom_forward_masked(ou:UOp, l_vecu:UOp, qu:UOp, ku:UOp, vu:UOp, masku:UOp) -> UOp:
-    return _custom_forward_impl(ou, l_vecu, qu, ku, vu, masku)
+    return _custom_forward_impl(ou, l_vecu, qu, ku, vu, masku, prec_dtype)
 
   def _custom_backward_q_impl(dqu:UOp, dou:UOp, qu:UOp, ku:UOp, vu:UOp, masku:UOp|None, l_vecu:UOp, delta_vecu:UOp) -> UOp:
     with Kernel("fa_custom_backward_q", (H, N // (Q_BLOCK_SIZE*NUM_WORKERS), B_local), NUM_WORKERS * WARP_THREADS) as ker:
@@ -164,23 +165,23 @@ def flash_attention(xq, xk, xv, attn_mask:Tensor|None=None, is_causal:bool=False
       q_seq = ker.blockIdx_y * NUM_WORKERS + ker.warpid
 
       q_reg_fl = ker.rt((Q_BLOCK_SIZE, D), dtypes.float32)
-      q_reg = ker.rt((Q_BLOCK_SIZE, D), dtypes.bfloat16)
-      q_reg_t = ker.rt((D, Q_BLOCK_SIZE), dtypes.bfloat16, TileLayout.COL)
-      k_reg = ker.rt((KV_BLOCK_SIZE, D), dtypes.bfloat16)
-      k_reg_t = ker.rt((D, KV_BLOCK_SIZE), dtypes.bfloat16, TileLayout.COL)
-      k_reg_col = ker.rt((KV_BLOCK_SIZE, D), dtypes.bfloat16, TileLayout.COL)
-      k_reg_col_t = ker.rt((D, KV_BLOCK_SIZE), dtypes.bfloat16)
-      v_reg = ker.rt((KV_BLOCK_SIZE, D), dtypes.bfloat16)
+      q_reg = ker.rt((Q_BLOCK_SIZE, D), prec_dtype)
+      q_reg_t = ker.rt((D, Q_BLOCK_SIZE), prec_dtype, TileLayout.COL)
+      k_reg = ker.rt((KV_BLOCK_SIZE, D), prec_dtype)
+      k_reg_t = ker.rt((D, KV_BLOCK_SIZE), prec_dtype, TileLayout.COL)
+      k_reg_col = ker.rt((KV_BLOCK_SIZE, D), prec_dtype, TileLayout.COL)
+      k_reg_col_t = ker.rt((D, KV_BLOCK_SIZE), prec_dtype)
+      v_reg = ker.rt((KV_BLOCK_SIZE, D), prec_dtype)
       mask_reg = ker.rt((Q_BLOCK_SIZE, KV_BLOCK_SIZE), dtypes.float32)
       mask_reg_transposed = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), dtypes.float32, TileLayout.COL)
 
       dq_reg = ker.rt((D, Q_BLOCK_SIZE), dtypes.float32, TileLayout.COL)
       dq_reg_transposed = ker.rt((Q_BLOCK_SIZE, D), dtypes.float32)
-      do_reg = ker.rt((Q_BLOCK_SIZE, D), dtypes.bfloat16)
+      do_reg = ker.rt((Q_BLOCK_SIZE, D), prec_dtype)
 
       dp_block = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), dtypes.float32, TileLayout.COL)
       att_block = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), dtypes.float32, TileLayout.COL)
-      att_block_mma = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), dtypes.bfloat16, TileLayout.COL)
+      att_block_mma = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), prec_dtype, TileLayout.COL)
 
       l_vec_reg = ker.rv(Q_BLOCK_SIZE, dtypes.float32)
       delta_vec_reg = ker.rv(Q_BLOCK_SIZE, dtypes.float32)
@@ -262,27 +263,27 @@ def flash_attention(xq, xk, xv, attn_mask:Tensor|None=None, is_causal:bool=False
       batch = ker.blockIdx_z
       kv_seq = ker.blockIdx_y * NUM_WORKERS + ker.warpid
 
-      att_smem = ker.st((Q_BLOCK_SIZE, KV_BLOCK_SIZE), dtypes.bfloat16)
+      att_smem = ker.st((Q_BLOCK_SIZE, KV_BLOCK_SIZE), prec_dtype)
 
-      q_reg = ker.rt((Q_BLOCK_SIZE, D), dtypes.bfloat16)
-      q_reg_t = ker.rt((D, Q_BLOCK_SIZE), dtypes.bfloat16, TileLayout.COL)
-      q_reg_col = ker.rt((Q_BLOCK_SIZE, D), dtypes.bfloat16, TileLayout.COL)
-      k_reg = ker.rt((KV_BLOCK_SIZE, D), dtypes.bfloat16)
-      k_reg_t = ker.rt((D, KV_BLOCK_SIZE), dtypes.bfloat16, TileLayout.COL)
-      v_reg = ker.rt((KV_BLOCK_SIZE, D), dtypes.bfloat16)
+      q_reg = ker.rt((Q_BLOCK_SIZE, D), prec_dtype)
+      q_reg_t = ker.rt((D, Q_BLOCK_SIZE), prec_dtype, TileLayout.COL)
+      q_reg_col = ker.rt((Q_BLOCK_SIZE, D), prec_dtype, TileLayout.COL)
+      k_reg = ker.rt((KV_BLOCK_SIZE, D), prec_dtype)
+      k_reg_t = ker.rt((D, KV_BLOCK_SIZE), prec_dtype, TileLayout.COL)
+      v_reg = ker.rt((KV_BLOCK_SIZE, D), prec_dtype)
       mask_reg = ker.rt((Q_BLOCK_SIZE, KV_BLOCK_SIZE), dtypes.float32)
       mask_reg_transposed = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), dtypes.float32, TileLayout.COL)
 
       dk_reg = ker.rt((KV_BLOCK_SIZE, D), dtypes.float32, TileLayout.COL)
       dv_reg = ker.rt((KV_BLOCK_SIZE, D), dtypes.float32, TileLayout.COL)
-      do_reg = ker.rt((Q_BLOCK_SIZE, D), dtypes.bfloat16)
-      do_reg_col = ker.rt((Q_BLOCK_SIZE, D), dtypes.bfloat16, TileLayout.COL)
+      do_reg = ker.rt((Q_BLOCK_SIZE, D), prec_dtype)
+      do_reg_col = ker.rt((Q_BLOCK_SIZE, D), prec_dtype, TileLayout.COL)
 
       dp_block = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), dtypes.float32, TileLayout.COL)
       att_block = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), dtypes.float32, TileLayout.COL)
-      att_block_mma = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), dtypes.bfloat16, TileLayout.COL)
-      att_block_transposed = ker.rt((Q_BLOCK_SIZE, KV_BLOCK_SIZE), dtypes.bfloat16, TileLayout.COL)
-      att_block_row = ker.rt((Q_BLOCK_SIZE, KV_BLOCK_SIZE), dtypes.bfloat16)
+      att_block_mma = ker.rt((KV_BLOCK_SIZE, Q_BLOCK_SIZE), prec_dtype, TileLayout.COL)
+      att_block_transposed = ker.rt((Q_BLOCK_SIZE, KV_BLOCK_SIZE), prec_dtype, TileLayout.COL)
+      att_block_row = ker.rt((Q_BLOCK_SIZE, KV_BLOCK_SIZE), prec_dtype)
 
       l_vec_reg = ker.rv(Q_BLOCK_SIZE, dtypes.float32)
       delta_vec_reg = ker.rv(Q_BLOCK_SIZE, dtypes.float32)

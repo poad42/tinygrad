@@ -514,9 +514,9 @@ class AMDHIPRenderer(CStyleLanguage):
   float4 = "make_float4"
   type_map = {dtypes.bfloat16: "hip_bfloat16", dtypes.fp8e4m3: "hip_fp8", dtypes.fp8e5m2: "hip_bf8"}
   extra_matcher = create_non_native_float_pats((dtypes.bfloat16, *dtypes.fp8s)) + PatternMatcher([
-    (UPat(Ops.WMMA, name="x", dtype=dtypes.float.vec(4)),
-      lambda x: UOp(Ops.WMMA, x.dtype, (x.src[0].bitcast(dtypes.uint64), x.src[1].bitcast(dtypes.uint64),
-        x.src[2]), (*x.arg,)) if x.src[0].dtype in (dtypes.fp8e4m3.vec(8), dtypes.fp8e5m2.vec(8)) else None),
+      (UPat(Ops.WMMA, name="x"),
+        lambda x: UOp(Ops.WMMA, x.dtype, (x.src[0].bitcast(dtypes.uint64 if x.dtype == dtypes.float.vec(4) else dtypes.int.vec(2)), x.src[1].bitcast(dtypes.uint64 if x.dtype == dtypes.float.vec(4) else dtypes.int.vec(2)),
+          x.src[2]), (*x.arg,)) if x.src[0].dtype in (dtypes.fp8e4m3.vec(8), dtypes.fp8e5m2.vec(8)) and x.dtype in (dtypes.float.vec(4), dtypes.float.vec(8)) else None),
     # bfloat16 constant casting
     (UPat.cvar('x', dtypes.bfloat16), lambda x: cast_float_to_bf16(UOp.const(dtypes.float, x.arg))),
   ])
@@ -528,7 +528,7 @@ class AMDHIPRenderer(CStyleLanguage):
 
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
     prefix, ockl = [], []
-    type_map = { dtypes.bfloat16: "bf16", dtypes.float: "f32", dtypes.half: "f16", dtypes.fp8e4m3: "_fp8_fp8", dtypes.fp8e5m2: "_bf8_bf8" }
+    type_map = { dtypes.bfloat16: "bf16", dtypes.float: "f32", dtypes.half: "f16", dtypes.fp8e4m3: "fp8_fp8", dtypes.fp8e5m2: "bf8_bf8" }
     used_dtypes = uops_to_dtypes(uops)
     if any(u.op is Ops.CONST and not math.isfinite(u.arg) for u in uops):
       prefix += ["#define INFINITY (__builtin_inff())", "#define NAN (__builtin_nanf(\"\"))"]
