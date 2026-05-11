@@ -550,7 +550,17 @@ class HIPRenderer(CStyleLanguage):
         prefix.append(f"#define __{name} __builtin_amdgcn_mfma_{'scale_' if K == 128 else ''}f32_{N}x{M}x{K}{type_map[dtype_in]}")
       # #define __WMMA_16_16_16_half_half __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12
       elif self.tensor_cores == tc.amd_rdna4:
-        prefix.append(f"#define __{name} __builtin_amdgcn_wmma_{type_map[dtype_out]}_16x16x16_{type_map[dtype_in]}_w32_gfx12")
+        # gfx12 WMMA intrinsic naming (clang 22 / rocm-llvm 7.2.3):
+        # fp16: ..._f32_..._f16_w32_gfx12 (single in-suffix)
+        # bf16: ..._f32_..._bf16_w32_gfx12
+        # fp8 : ..._f32_..._fp8_fp8_w32_gfx12  (DOUBLE in-suffix, A and B)
+        # bf8 : ..._f32_..._bf8_bf8_w32_gfx12
+        wmma_out_map = {dtypes.half: "f16", dtypes.bfloat16: "bf16", dtypes.float: "f32"}
+        wmma_in_map  = {dtypes.half: "f16", dtypes.bfloat16: "bf16",
+                        dtypes.fp8e4m3: "fp8_fp8", dtypes.fp8e5m2: "bf8_bf8"}
+        suffix_in  = wmma_in_map[dtype_in]
+        suffix_out = wmma_out_map[dtype_out]
+        prefix.append(f"#define __{name} __builtin_amdgcn_wmma_{suffix_out}_16x16x16_{suffix_in}_w32_gfx12")
       elif dtype_out == dtypes.float:
         prefix.append(f"#define __{name} __builtin_amdgcn_wmma_f32_16x16x16_{'f16' if dtype_in == dtypes.half else 'bf16'}_w32")
       else: prefix.append(f"static inline __attribute__((device)) half8 __{name}"+"""(half16 a, half16 b, half8 c) {

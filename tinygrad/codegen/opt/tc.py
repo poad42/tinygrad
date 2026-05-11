@@ -110,6 +110,23 @@ amd_rdna4 = [TensorCore(dims=(16,16,16), threads=32, elements_per_thread=(8,8,8)
            (('l0', 'l1', 'l2', 'l3', 'r2'), ('r0', 'r1', 'r3'), ('l4', 'u0', 'u1', 'u2'))))
   for di,do in [(dtypes.half,dtypes.float),(dtypes.half,dtypes.half),(dtypes.bfloat16,dtypes.float),(dtypes.bfloat16,dtypes.bfloat16)]]
 
+# RDNA4 INT8 (V_WMMA_I32_16X16X16_IU8) - 8x ALU rate vs fp32
+amd_rdna4_int8 = [TensorCore(dims=(16,16,16), threads=32, elements_per_thread=(8,8,8),
+  dtype_in=dtypes.int8, dtype_out=dtypes.int32,
+  opts=("l0","l0","l0","l0","u1","u1","u1","l1"),
+  swizzle=((('u0', 'u1', 'u2', 'l4', 'r2'), ('r0', 'r1', 'r3'), ('l0', 'l1', 'l2', 'l3')),
+           (('l0', 'l1', 'l2', 'l3', 'r2'), ('r0', 'r1', 'r3'), ('l4', 'u0', 'u1', 'u2'))))]
+
+# RDNA4 FP8 e4m3 / e5m2 (V_WMMA_F32_16X16X16_FP8/BF8) - 8x rate vs fp32
+amd_rdna4_fp8 = [TensorCore(dims=(16,16,16), threads=32, elements_per_thread=(8,8,8),
+  dtype_in=di, dtype_out=dtypes.float,
+  opts=("l0","l0","l0","l0","u1","u1","u1","l1"),
+  swizzle=((('u0', 'u1', 'u2', 'l4', 'r2'), ('r0', 'r1', 'r3'), ('l0', 'l1', 'l2', 'l3')),
+           (('l0', 'l1', 'l2', 'l3', 'r2'), ('r0', 'r1', 'r3'), ('l4', 'u0', 'u1', 'u2'))))
+  for di in [dtypes.fp8e4m3, dtypes.fp8e5m2]]
+
+amd_rdna4 = amd_rdna4 + amd_rdna4_fp8  # int8 disabled: cstyle.py vector-cast bug
+
 # https://gpuopen.com/learn/amd-lab-notes/amd-lab-notes-matrix-cores-readme
 amd_cdna_161616 = [TensorCore(dims=(16,16,16), threads=64, elements_per_thread=(4,4,4), dtype_in=di, dtype_out=do,
   opts=("l0","l0","l0","l0","u1","u1","l1","l1"),

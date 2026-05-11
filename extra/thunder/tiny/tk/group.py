@@ -213,7 +213,7 @@ class Group:
     red_reg = self.ker.alloc((1,), src.dtype.base, AddrSpace.REG)
 
     for height in self.ker.range(src.shape[-3], track=False):
-      i = self.ker.raw_range(red_reg.size)
+      i = self.ker.raw_range(red_reg.numel())
       red_reg = red_reg.after(height, *[tkr._rng for tkr in self.ker.range_stack])
       reg_store = red_reg.flatten()[i].store(init_value).end(i)
       red_reg = red_reg.after(reg_store).reshape(red_reg.shape)
@@ -247,7 +247,7 @@ class Group:
     red_reg = self.ker.alloc((1,), src.dtype.base, AddrSpace.REG)
 
     for width in self.ker.range(src.shape[-2], track=False):
-      i = self.ker.raw_range(red_reg.size)
+      i = self.ker.raw_range(red_reg.numel())
       red_reg = red_reg.after(width, *[tkr._rng for tkr in self.ker.range_stack])
       reg_store = red_reg.flatten()[i].store(init_value).end(i)
       red_reg = red_reg.after(reg_store).reshape(red_reg.shape)
