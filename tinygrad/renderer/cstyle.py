@@ -502,8 +502,15 @@ class HIPRenderer(CStyleLanguage):
   float4 = "make_float4"
   type_map = {dtypes.bfloat16: "hip_bfloat16", dtypes.fp8e4m3: "hip_fp8", dtypes.fp8e5m2: "hip_bf8"}
   extra_matcher = create_non_native_float_pats((dtypes.bfloat16, *dtypes.fp8s)) + PatternMatcher([
+    # CDNA MFMA: fp8 vec(8) -> bitcast to uint64 (float.vec(4) accumulator)
     (UPat(Ops.WMMA, name="x", dtype=dtypes.float.vec(4)),
       lambda x: UOp(Ops.WMMA, x.dtype, (x.src[0].bitcast(dtypes.uint64), x.src[1].bitcast(dtypes.uint64),
+        x.src[2]), (*x.arg,)) if x.src[0].dtype in (dtypes.fp8e4m3.vec(8), dtypes.fp8e5m2.vec(8)) else None),
+    # RDNA4 WMMA: fp8 vec(8) -> bitcast to int.vec(2) (float.vec(8) accumulator)
+    # The intrinsic __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12 expects
+    # A,B as int2 (= 2 packed i32 = 8 packed fp8 = 64 bits each).
+    (UPat(Ops.WMMA, name="x", dtype=dtypes.float.vec(8)),
+      lambda x: UOp(Ops.WMMA, x.dtype, (x.src[0].bitcast(dtypes.int.vec(2)), x.src[1].bitcast(dtypes.int.vec(2)),
         x.src[2]), (*x.arg,)) if x.src[0].dtype in (dtypes.fp8e4m3.vec(8), dtypes.fp8e5m2.vec(8)) else None),
     # bfloat16 constant casting
     (UPat.cvar('x', dtypes.bfloat16), lambda x: cast_float_to_bf16(UOp.const(dtypes.float, x.arg))),
